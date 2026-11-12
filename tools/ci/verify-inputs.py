@@ -19,15 +19,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--run-id', required=True)
-    parser.add_argument('--commit', required=True)
+    parser.add_argument('--commit')
     args = parser.parse_args()
     browser = args.directory / 'browser'
     runtime = args.directory / 'ui-runtime'
     record = json.loads((browser / 'browser-build.json').read_text(encoding='utf-8'))
     ui = json.loads((runtime / 'build-info.json').read_text(encoding='utf-8'))
     manifest = json.loads((runtime / 'runtime-manifest.json').read_text(encoding='utf-8'))
-    if (record['repository'] != 'perpetus/Krypton' or record['run_id'] != args.run_id
-            or record['commit'] != args.commit
+    if (record['repository'] != 'perpetus/Krypton'
+            or record['run_repository'] != 'perpetus/krypton-windows'
+            or record['run_id'] != args.run_id
+            or (args.commit and record['commit'] != args.commit)
             or ui['repository'] != 'perpetus/KryptonUI' or record['ui_commit'] != ui['commit']
             or not re.fullmatch(r'[0-9a-f]{40}', record['commit'])
             or not re.fullmatch(r'[0-9a-f]{40}', record['ui_commit'])):

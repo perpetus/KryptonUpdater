@@ -1,0 +1,30 @@
+name: Prepare hosted installer toolchain
+description: Set up verified Ninja and the pinned static POCO build
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7.1.0
+      with:
+        python-version: '3.14'
+    - uses: perpetus/KryptonUI/.github/actions/setup-ninja@main
+    - uses: actions/checkout@v7.0.1
+      with:
+        repository: microsoft/vcpkg
+        ref: 58613d018f126ccaa9dac9a02b11142cb0f4f4ea
+        path: vcpkg
+        persist-credentials: false
+    - uses: actions/cache@v6.1.0
+      with:
+        path: ${{ runner.temp }}/vcpkg-binaries
+        key: windows-2025-vs2026-poco-static-58613d018f126ccaa9dac9a02b11142cb0f4f4ea-v1
+    - name: Build static dependencies
+      shell: pwsh
+      run: |
+        $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binaries'
+        New-Item -ItemType Directory -Path $cache -Force | Out-Null
+        $env:VCPKG_BINARY_SOURCES = "clear;files,$cache,readwrite"
+        ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        ./vcpkg/vcpkg.exe install 'poco[core,sevenzip,json,util]:x64-windows-static' --disable-metrics
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "VCPKG_ROOT=$env:GITHUB_WORKSPACE/vcpkg" >> $env:GITHUB_ENV

@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$PayloadRoot,
-  [Parameter(Mandatory)][string]$UiSource
+  [Parameter(Mandatory)][string]$UiSource,
+  [Parameter(Mandatory)][string]$BrowserSource,
+  [Parameter(Mandatory)][string]$ReleaseSource
 )
 
 # This pipeline creates artifacts only. Publishing an update is separate.
@@ -23,7 +25,7 @@ if ($version -ne $record.product_version -or $version -notmatch '^\d+\.\d+\.\d+\
 }
 $key = if ($env:KRYPTON_RELEASE_KEY_PATH) { $env:KRYPTON_RELEASE_KEY_PATH }
   else { Join-Path $env:USERPROFILE '.krypton/signing/release-key.dpapi' }
-if (-not (Test-Path -LiteralPath $key)) { throw 'Provision the existing DPAPI release key for the signing-runner account.' }
+if (-not $env:KRYPTON_RELEASE_KEY_PKCS8 -and -not (Test-Path -LiteralPath $key)) { throw 'The existing release signing key is required.' }
 $ninja = (Get-Command $(if ($env:KRYPTON_NINJA) { $env:KRYPTON_NINJA } else { 'ninja.exe' }) -ErrorAction Stop).Source
 $ninjaVersion = & $ninja --version
 if ($LASTEXITCODE -ne 0 -or $ninjaVersion -ne '1.13.2') { throw 'Native Ninja 1.13.2 is required.' }
@@ -102,6 +104,9 @@ try {
   }
   Invoke-Checked python @('tools/prepare-release.py', '--package-json', $packageJson,
     '--output-dir', "$output/github", '--key-path', $key, '--zucchini', "$browser/KryptonPatch.exe")
+  Invoke-Checked python @("$ReleaseSource/tools/stage-release.py", '--updater-root', $root,
+    '--browser-root', $BrowserSource, '--ui-root', $UiSource, '--ui-binary', "$runtime/krypton_ui.dll",
+    '--dist-dir', $output, '--release-type', 'stable')
   [ordered]@{ version = $version; browser_commit = $record.commit; ui_commit = $record.ui_commit;
     source_run_id = $record.run_id; updater_commit = (& git rev-parse HEAD) } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'build-info.json') -Encoding utf8NoBOM

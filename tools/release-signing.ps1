@@ -44,7 +44,13 @@ try {
   if (-not $SignatureFile) { $SignatureFile = "$InputFile.sig" }
   $signingStream = [IO.File]::OpenRead((Resolve-Path -LiteralPath $InputFile).Path)
   if ($Command -eq 'sign') {
-    $private = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $KeyPath).Path), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    # Hosted release jobs receive the existing key through an environment secret.
+    # Local signing keeps the account-bound DPAPI path; the trust key is unchanged.
+    $private = if ($env:KRYPTON_RELEASE_KEY_PKCS8) {
+      [Convert]::FromBase64String($env:KRYPTON_RELEASE_KEY_PKCS8)
+    } else {
+      [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $KeyPath).Path), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    }
     try {
       $used = 0
       $ecdsa.ImportPkcs8PrivateKey($private, [ref]$used)

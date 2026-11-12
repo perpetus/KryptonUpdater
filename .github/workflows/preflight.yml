@@ -1,0 +1,43 @@
+name: Verify hosted signing and installer prerequisites
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: windows-2025-vs2026
+    environment: installer-signing
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: perpetus/KryptonUpdater
+          ref: ${{ inputs.ref }}
+          path: updater
+          persist-credentials: false
+      - name: Verify existing release trust before Chromium compilation
+        shell: pwsh
+        env:
+          KRYPTON_RELEASE_KEY_PKCS8: ${{ secrets.KRYPTON_RELEASE_KEY_PKCS8 }}
+        run: |
+          if (-not $env:KRYPTON_RELEASE_KEY_PKCS8) { throw 'The protected release signing secret is missing.' }
+          $record = Join-Path $env:RUNNER_TEMP 'signing-preflight.json'
+          '{"purpose":"Krypton release signing preflight"}' | Set-Content -LiteralPath $record -Encoding utf8NoBOM
+          ./updater/tools/release-signing.ps1 sign -InputFile $record
+          ./updater/tools/release-signing.ps1 verify -InputFile $record
+      - name: Verify pinned Microsoft prerequisites
+        shell: pwsh
+        run: |
+          $pins = Get-Content -LiteralPath updater/tools/prerequisites.json -Raw | ConvertFrom-Json
+          foreach ($pin in @($pins.visual_cpp, $pins.windows_app_runtime)) {
+            $file = Join-Path $env:RUNNER_TEMP $pin.filename
+            Invoke-WebRequest $pin.url -OutFile $file
+            if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) { throw "Prerequisite hash mismatch: $($pin.filename)" }
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw "Prerequisite signature mismatch: $($pin.filename)" }
+          }
+      - uses: ./updater/.github/actions/prepare-hosted
