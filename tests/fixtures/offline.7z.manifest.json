@@ -1,0 +1,20 @@
+{
+  "version": "0.19.4-dev.1",
+  "files": [
+    {
+      "path": "chrome.exe",
+      "sha256": "2066341329d9318d7a431a5258f68ff84a962b71b436005fe4818d5d35e0385c",
+      "size": 21
+    },
+    {
+      "path": "krypton-launcher.exe",
+      "sha256": "a3b4069d3fb395e849427ef2192b04307aa3aaab8c59ef22cb0e9b32ae610ab5",
+      "size": 22
+    },
+    {
+      "path": "krypton-updater.exe",
+      "sha256": "b68154631de1e54320c6b4abe8a2a794430a47ab854e0b66ce533a8fd1a59400",
+      "size": 21
+    }
+  ]
+}

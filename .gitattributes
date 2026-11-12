@@ -1,0 +1,5 @@
+* text=auto
+*.png binary
+*.ico binary
+*.icon binary
+*.7z binary

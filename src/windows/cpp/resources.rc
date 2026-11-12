@@ -1,0 +1,24 @@
+#include <windows.h>
+#include "krypton/updater/windows/resource_ids.h"
+
+IDI_APP_ICON ICON "../../../assets/installer.ico"
+IDR_PRODUCT_LOGO RCDATA "../../../assets/product_logo_200.png"
+IDR_TITLEBAR_ICON RCDATA "../../../assets/installer_titlebar.png"
+
+#ifdef KR_EMBED_ZUCCHINI_FILE
+IDR_ZUCCHINI_HELPER RCDATA KR_EMBED_ZUCCHINI_FILE
+IDR_ZUCCHINI_LICENSE RCDATA "../../../licenses/Chromium-Zucchini-LICENSE.txt"
+IDR_CHROMIUM_NOTICES RCDATA "../../../licenses/Chromium-Third-Party-Notices.html"
+#endif
+
+#ifdef KR_EMBED_PAYLOAD_FILE
+IDR_OFFLINE_PAYLOAD RCDATA KR_EMBED_PAYLOAD_FILE
+#endif
+
+#ifdef KR_EMBED_MANIFEST_FILE
+IDR_OFFLINE_MANIFEST RCDATA KR_EMBED_MANIFEST_FILE
+#endif
+
+#ifdef KR_EMBED_SIGNATURE_FILE
+IDR_OFFLINE_SIGNATURE RCDATA KR_EMBED_SIGNATURE_FILE
+#endif

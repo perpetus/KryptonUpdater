@@ -1,0 +1,30 @@
+name: Check source configuration
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Check owned script syntax and JSON configuration
+        shell: python
+        run: |
+          import ast
+          import json
+          from pathlib import Path
+          for path in Path('tools').rglob('*.py'):
+              ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+          for path in [Path('CMakePresets.json'), *Path('resources').glob('*.json'), Path('tools/prerequisites.json')]:
+              json.loads(path.read_text(encoding='utf-8-sig'))
+          print('Script syntax and JSON configuration are valid. No tests were run.')
