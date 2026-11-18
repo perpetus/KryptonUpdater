@@ -37,11 +37,16 @@ def verify_delta(base, target, destination, zucchini, timeout_seconds):
         reconstructed.unlink(missing_ok=True)
 
 
-def create_delta(base, target, destination, zucchini, timeout_seconds):
-    """Generate and verify a Google Zucchini patch using the pinned build tool."""
+def create_delta(base, target, destination, zucchini, timeout_seconds, generator=None, threads=0):
+    """Generate a compatible patch, then verify with the unchanged client helper."""
     deadline = time.monotonic() + timeout_seconds
-    subprocess.run([str(zucchini), "-gen", str(base), str(target), str(destination)],
-                   check=True, timeout=timeout_seconds)
+    command = [str(generator or zucchini), "-gen", str(base), str(target), str(destination)]
+    if generator:
+        command.append(f"-threads={threads}")
+    elif base.suffix.lower() == ".7z" and target.suffix.lower() == ".7z":
+        # Compressed delivery archives expose no useful executable elements.
+        command.append("-raw")
+    subprocess.run(command, check=True, timeout=timeout_seconds)
     verify_delta(base, target, destination, zucchini,
                  max(0.01, deadline - time.monotonic()))
 
@@ -94,6 +99,12 @@ def main():
     parser.add_argument("--key-path", type=Path)
     parser.add_argument("--zucchini", type=Path, default=Path(__file__).resolve().parents[2] /
                         "Krypton/build/src/out/Default/KryptonPatch.exe")
+    parser.add_argument("--delta-generator", type=Path,
+                        help="Publisher-only parallel generator; patches retain the existing Zucchini format")
+    parser.add_argument("--delta-threads", type=int, default=0,
+                        help="Parallel generation workers; 0 selects all CPU threads (default)")
+    parser.add_argument("--keep-large-deltas", action="store_true",
+                        help="Retain explicitly requested, verified deltas with less than 15%% savings")
     parser.add_argument("--expires-days", type=int, default=90, choices=range(1, 91))
     parser.add_argument("--sequence", type=int)
     args = parser.parse_args()
@@ -101,6 +112,8 @@ def main():
         parser.error("At most four delta bases are supported")
     if args.delta_timeout_seconds <= 0:
         parser.error("The delta timeout must be positive")
+    if args.delta_threads < 0:
+        parser.error("The delta thread count cannot be negative")
     package = json.loads(args.package_json.read_text(encoding="utf-8"))
     archive = Path(package["archive"]).resolve(strict=True)
     metadata = Path(package["manifest"]).resolve(strict=True)
@@ -117,6 +130,12 @@ def main():
         bases = []
         print("Optional delta generation skipped; preparing the signed full update.", flush=True)
     zucchini = args.zucchini.resolve(strict=True) if bases else None
+    generator = args.delta_generator
+    if generator is None and zucchini:
+        candidate = zucchini.with_name("KryptonDeltaGenerator.exe")
+        if candidate.is_file():
+            generator = candidate
+    generator = generator.resolve(strict=True) if generator and bases else None
     delta_deadline = time.monotonic() + args.delta_timeout_seconds
     for base_path in bases:
         base = json.loads(base_path.read_text(encoding="utf-8"))
@@ -139,7 +158,8 @@ def main():
                 print("Verifying the existing delta before reuse.", flush=True)
                 verify_delta(base_archive, archive, patch, zucchini, remaining)
             else:
-                create_delta(base_archive, archive, patch, zucchini, remaining)
+                create_delta(base_archive, archive, patch, zucchini, remaining,
+                             generator, args.delta_threads)
         except subprocess.TimeoutExpired:
             patch.unlink(missing_ok=True)
             print("Delta time budget exhausted; publishing the verified full update.", flush=True)
@@ -149,9 +169,13 @@ def main():
             print(f"Delta unavailable for {base['browser_version']}: {error}; publishing the full package", flush=True)
             continue
         if patch.stat().st_size >= int(full.stat().st_size * .85):
-            patch.unlink()
-            print(f"Delta for {base['browser_version']} omitted: less than 15% bandwidth reduction")
-            continue
+            if not args.keep_large_deltas:
+                patch.unlink()
+                print(f"Delta for {base['browser_version']} omitted: less than 15% bandwidth reduction")
+                continue
+            print(f"Keeping the explicitly requested verified delta for {base['browser_version']}: "
+                  f"{patch.stat().st_size:,} bytes, "
+                  f"{100 * (1 - patch.stat().st_size / full.stat().st_size):.2f}% bandwidth reduction.")
         deltas.append({**asset(patch), "algorithm": "zucchini", "base_version": base["browser_version"],
                        "base_sha256": base["archive_sha256"]})
     deltas.sort(key=lambda item: item["size"])

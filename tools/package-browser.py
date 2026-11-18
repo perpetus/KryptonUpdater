@@ -119,6 +119,9 @@ def stage(args):
     for helper in (args.updater, args.uninstaller):
         if file_version(helper.resolve(strict=True)) != browser_version:
             raise ValueError(f"{helper.name} must carry browser file version {browser_version}")
+    engine_version = file_version(browser / "chrome.exe", product=True)
+    if file_version(browser / "setup.exe", product=True) != engine_version:
+        raise ValueError(f"Native setup must match the browser engine version {engine_version}")
     version = chrome / browser_version
     distribution = browser.parents[1] / "chrome/installer/mini_installer/chrome.release"
     rules = configparser.ConfigParser(interpolation=None, strict=False)
@@ -142,7 +145,8 @@ def stage(args):
             relative = Path(target)
             if relative.is_absolute() or ".." in relative.parts:
                 raise ValueError(f"Unsafe distribution target: {target}")
-            for item in browser.glob(pattern.replace("\\", "/")):
+            glob = f"{browser_version}.manifest" if pattern == "*.*.*.*.manifest" else pattern
+            for item in browser.glob(glob.replace("\\", "/")):
                 if item.is_file():
                     copy(item, chrome / relative / item.name)
 
@@ -151,6 +155,26 @@ def stage(args):
     for name in ("hr_classic.png", "hr_compact.png", "hr_dyn.png", "vt_compact.png",
                  "vt_sidebar.png", "vt_sidebar_title.png"):
         copy(browser / "assets/settings" / name, version / "assets/settings" / name)
+    # The browser loads these libraries by path, so PE import scanning cannot
+    # discover them. Native setup moves the version directory as a unit.
+    for binaries, components in (
+        (("krypton_translate.dll",), ("krypton_bergamot",)),
+        (("krypton_speech.dll", "onnxruntime.dll"),
+         ("krypton_moonshine", "krypton_onnxruntime")),
+    ):
+        if not any((browser / name).is_file() for name in binaries):
+            continue
+        for name in binaries:
+            copy(browser / name, version / name)
+        for component in components:
+            notices = browser.parents[1] / "third_party" / component
+            if not (notices / "LICENSE").is_file():
+                raise ValueError(f"Missing distribution notices for {component}")
+            for pattern in ("LICENSE", "README.chromium", "ThirdPartyNotices.txt",
+                            "Privacy.md", "notices/*/LICENSE", "notices/*/README.chromium"):
+                for item in sorted(notices.glob(pattern)):
+                    if item.is_file():
+                        copy(item, version / "Installer/Licenses" / component / item.relative_to(notices))
     for pattern in ("msvcp*.dll", "vcruntime*.dll", "concrt*.dll"):
         for item in browser.glob(pattern):
             copy(item, version / item.name)
@@ -175,7 +199,8 @@ def stage(args):
                 queue.append(version / name)
 
     for item in (chrome / "chrome.exe", version / "chrome.dll",
-                 version / "chrome_elf.dll", version / "resources.pak", version / "icudtl.dat"):
+                 version / "chrome_elf.dll", version / f"{browser_version}.manifest",
+                 version / "resources.pak", version / "icudtl.dat"):
         if not item.is_file():
             raise ValueError(f"Required native browser file is missing: {item}")
     if not any((version / "Locales").glob("*.pak")):
@@ -191,7 +216,7 @@ def stage(args):
         copy(Path(str(helper) + ".sig"), version / "Installer" / (helper.name + ".sig"))
     copy(browser / "setup.exe", payload / "setup.exe")
     (version / "Installer/KryptonPackage.manifest").write_text(
-        f"[Package]\nVersion={browser_version}\nEngineVersion={file_version(browser / 'chrome.exe', product=True)}\nSetupSha256={digest(payload / 'setup.exe')}\n",
+        f"[Package]\nVersion={browser_version}\nEngineVersion={engine_version}\nSetupSha256={digest(payload / 'setup.exe')}\n",
         encoding="ascii")
     marker = version / "Installer/KryptonPackage.manifest"
     sign(marker, args.key_path)

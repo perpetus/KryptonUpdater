@@ -10,6 +10,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Add-Type -AssemblyName System.Security.Cryptography
+# Keep Span-based key import and secure clearing inside managed code so the
+# PowerShell binder only handles byte arrays, including on older hosts.
+Add-Type -TypeDefinition @'
+using System.Security.Cryptography;
+
+namespace Krypton.ReleaseSigning {
+  public static class KeyMaterial {
+    public static void Import(ECDsa key, byte[] bytes) {
+      key.ImportPkcs8PrivateKey(bytes, out int consumed);
+      if (consumed != bytes.Length) {
+        throw new CryptographicException("Unexpected trailing private-key data.");
+      }
+    }
+
+    public static void Clear(byte[] bytes) {
+      CryptographicOperations.ZeroMemory(bytes);
+    }
+  }
+}
+'@
 $ecdsa = [Security.Cryptography.ECDsa]::Create([Security.Cryptography.ECCurve+NamedCurves]::nistP256)
 $signingStream = $null
 try {
@@ -27,7 +47,7 @@ try {
     try {
       $encrypted = [Security.Cryptography.ProtectedData]::Protect($private, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
       [IO.File]::WriteAllBytes([IO.Path]::GetFullPath($KeyPath), $encrypted)
-    } finally { [Security.Cryptography.CryptographicOperations]::ZeroMemory($private) }
+    } finally { [Krypton.ReleaseSigning.KeyMaterial]::Clear($private) }
     $public = $ecdsa.ExportParameters($false)
     $point = [byte[]](@(4) + $public.Q.X + $public.Q.Y)
     $keyId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($point)).ToLowerInvariant()
@@ -46,21 +66,20 @@ try {
   if ($Command -eq 'sign') {
     # Hosted release jobs receive the existing key through an environment secret.
     # Local signing keeps the account-bound DPAPI path; the trust key is unchanged.
-    $private = if ($env:KRYPTON_RELEASE_KEY_PKCS8) {
+    [byte[]]$private = if ($env:KRYPTON_RELEASE_KEY_PKCS8) {
       [Convert]::FromBase64String($env:KRYPTON_RELEASE_KEY_PKCS8)
     } else {
       [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $KeyPath).Path), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
     }
     try {
-      $used = 0
-      $ecdsa.ImportPkcs8PrivateKey($private, [ref]$used)
+      [Krypton.ReleaseSigning.KeyMaterial]::Import($ecdsa, $private)
       $trust = Get-Content -LiteralPath $TrustFile -Raw | ConvertFrom-Json
       $public = $ecdsa.ExportParameters($false)
       $point = [byte[]](@(4) + $public.Q.X + $public.Q.Y)
       if ([Convert]::ToHexString($point).ToLowerInvariant() -cne $trust.public_key) { throw 'The signing key does not match the pinned public key.' }
       $signature = $ecdsa.SignData($signingStream, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
       [IO.File]::WriteAllBytes([IO.Path]::GetFullPath($SignatureFile), $signature)
-    } finally { [Security.Cryptography.CryptographicOperations]::ZeroMemory($private) }
+    } finally { [Krypton.ReleaseSigning.KeyMaterial]::Clear($private) }
   } else {
     $trust = Get-Content -LiteralPath $TrustFile -Raw | ConvertFrom-Json
     $point = [Convert]::FromHexString($trust.public_key)
