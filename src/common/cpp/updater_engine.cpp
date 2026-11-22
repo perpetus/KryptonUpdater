@@ -66,6 +66,13 @@ void UpdaterEngine::Cancel() {
 
 int UpdaterEngine::Execute() {
 #ifdef _WIN32
+#if !defined(KR_UPDATER_TEST_SEAMS)
+  if (options_.verify_only_for_testing ||
+      options_.skip_prerequisites_for_testing) {
+    state_machine_.ReportError("Test-only installer options are unavailable.");
+    return 1;
+  }
+#endif
   if (options_.preview_mode) {
     state_machine_.TransitionTo(UpdateState::kInstalling);
     return 0;
@@ -81,30 +88,26 @@ int UpdaterEngine::Execute() {
   }
   if (options_.force_offline || windows::OfflinePayload::HasEmbeddedPayload() ||
       !options_.custom_package_path.empty()) {
-    auto package = options_.custom_package_path;
-    bool temporary = false;
-    std::string_view manifest;
-    if (package.empty() && windows::OfflinePayload::HasEmbeddedPayload()) {
-      const auto extracted = windows::OfflinePayload::ExtractToTempFile();
-      if (!extracted) {
-        state_machine_.ReportError(
-            "Could not read the embedded offline package.");
-        return 1;
-      }
-      package = *extracted;
-      temporary = true;
-      manifest = windows::OfflinePayload::GetEmbeddedManifest();
-    }
-    if (package.empty()) {
+    if (!options_.custom_package_path.empty())
+      return ExecuteOffline(options_.custom_package_path, {});
+    if (!windows::OfflinePayload::HasEmbeddedPayload()) {
       state_machine_.ReportError("No offline package was provided.");
       return 1;
     }
-    const int result = ExecuteOffline(package, manifest);
-    if (temporary) {
-      std::error_code ignored;
-      std::filesystem::remove(package, ignored);
+    auto workspace = windows::TemporaryInstallDirectory::Create();
+    if (!workspace) {
+      state_machine_.ReportError(workspace.error());
+      return 1;
     }
-    return result;
+    const auto package =
+        windows::OfflinePayload::ExtractToFile(workspace->path());
+    if (!package) {
+      state_machine_.ReportError(
+          "Could not extract the embedded offline package.");
+      return 1;
+    }
+    return ExecuteOffline(*package,
+                          windows::OfflinePayload::GetEmbeddedManifest());
   }
   return ExecuteOnline();
 #else
@@ -136,7 +139,13 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
 
   if (type == windows::PayloadType::kMsi ||
       type == windows::PayloadType::kExe) {
-    const auto signature = windows::AuthenticodeVerifier::Verify(payload_path);
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(payload_path, error);
+    auto lock = error ? windows::ScopedFileHandle{}
+                      : windows::LockFileForVerification(absolute);
+    const auto signature = lock
+                               ? windows::AuthenticodeVerifier::Verify(absolute)
+                               : windows::SignatureStatus::kVerificationFailed;
     if (signature != windows::SignatureStatus::kValidAndTrusted) {
       state_machine_.ReportSecurityAlert(SecurityAlert{
           std::format("Payload signature verification: {}",
@@ -150,9 +159,9 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
     std::uint32_t exit_code = 0;
     const bool success =
         type == windows::PayloadType::kMsi
-            ? windows::PayloadRunner::RunMsi(payload_path, true, &exit_code)
-            : windows::PayloadRunner::RunExe(payload_path, L"/SILENT",
-                                             &exit_code);
+            ? windows::PayloadRunner::RunMsi(absolute, true, &exit_code)
+            : windows::PayloadRunner::RunExe(absolute, L"/SILENT", &exit_code,
+                                             std::move(lock));
     if (!success) {
       state_machine_.ReportError(
           std::format("Installer execution failed with code {}", exit_code));
@@ -391,7 +400,12 @@ int UpdaterEngine::ExecuteOnline() {
             ? ParseBrowserVersion(installed->version)
             : std::expected<BrowserVersion, std::string>(BrowserVersion{});
     const auto next = ParseBrowserVersion(release->version);
-    const bool available = !current || !next || *next > *current;
+    if (!current || !next) {
+      state_machine_.ReportError(
+          "Could not compare installed and published browser versions.");
+      return 1;
+    }
+    const bool available = *next > *current;
     state_machine_.TransitionTo(available ? UpdateState::kUpdateAvailable
                                           : UpdateState::kUpToDate);
     return 0;

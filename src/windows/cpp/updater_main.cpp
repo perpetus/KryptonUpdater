@@ -21,6 +21,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       const std::wstring_view arg(arguments[index]);
       if (arg == L"--worker")
         options.worker = true;
+      else if (arg == L"--browser-start")
+        options.browser_start = true;
       else if (arg == L"--check")
         options.check_only = true;
       else if (arg == L"--download-only")
@@ -33,8 +35,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         options.release_file = std::filesystem::absolute(arguments[++index]);
       else if (arg == L"--uninstall")
         uninstall = true;
-      else if (arg != L"--silent" && arg != L"--browser-start" &&
-               arg != L"--update-silent") {
+      else if (arg != L"--silent" && arg != L"--update-silent") {
         LocalFree(arguments);
         return ERROR_INVALID_PARAMETER;
       }

@@ -9,7 +9,7 @@ import subprocess
 import time
 
 
-SIGNING = Path(__file__).with_name("release-signing.ps1")
+from release_signing import add_key_arguments, read_signing_key, signature as signing
 REPOSITORY = "perpetus/krypton-windows"
 
 
@@ -17,12 +17,6 @@ def sha256(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
-
-def signing(command, path, key=None):
-    args = ["pwsh", "-NoProfile", "-File", str(SIGNING), command, "-InputFile", str(path)]
-    if key and command == "sign":
-        args += ["-KeyPath", str(key)]
-    subprocess.run(args, check=True)
 
 
 def verify_delta(base, target, destination, zucchini, timeout_seconds):
@@ -96,7 +90,7 @@ def main():
                         help="Publish the verified full package without generating optional deltas")
     parser.add_argument("--delta-timeout-seconds", type=int, default=300,
                         help="Total time budget for optional delta generation and reconstruction (default: 300)")
-    parser.add_argument("--key-path", type=Path)
+    add_key_arguments(parser)
     parser.add_argument("--zucchini", type=Path, default=Path(__file__).resolve().parents[2] /
                         "Krypton/build/src/out/Default/KryptonPatch.exe")
     parser.add_argument("--delta-generator", type=Path,
@@ -108,6 +102,7 @@ def main():
     parser.add_argument("--expires-days", type=int, default=90, choices=range(1, 91))
     parser.add_argument("--sequence", type=int)
     args = parser.parse_args()
+    hosted_key = read_signing_key(args.signing_key_stdin)
     if len(args.base_package_json) > 4:
         parser.error("At most four delta bases are supported")
     if args.delta_timeout_seconds <= 0:
@@ -192,7 +187,7 @@ def main():
                "package_signature": Path(str(metadata) + ".sig").read_bytes().hex()}
     output = args.output_dir / "KryptonUpdate-win-x64.json"
     output.write_bytes((json.dumps(release, indent=2) + "\n").encode("utf-8"))
-    signing("sign", output, args.key_path)
+    signing("sign", output, args.key_path, hosted_key)
     signing("verify", output)
     publish = {"repository": REPOSITORY, "tag": release["tag"],
                "assets": [full.name, output.name, output.name + ".sig"] + [delta["name"] for delta in deltas],

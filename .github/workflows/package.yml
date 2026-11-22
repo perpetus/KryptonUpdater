@@ -69,15 +69,19 @@ jobs:
           ref: ${{ github.sha }}
           path: release-source
           persist-credentials: false
+      - name: Fetch and verify the optional update base
+        shell: pwsh
+        env:
+          BASE_VERSION: ${{ inputs.base-version }}
+        run: |
+          python updater/tools/ci/fetch-base.py --version $env:BASE_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and verify signed installers and source archive
         shell: pwsh
         env:
           PAYLOAD_ROOT: ${{ runner.temp }}/krypton-package
           KRYPTON_RELEASE_KEY_PKCS8: ${{ secrets.KRYPTON_RELEASE_KEY_PKCS8 }}
-          BASE_VERSION: ${{ inputs.base-version }}
         run: |
-          python updater/tools/ci/fetch-base.py --version $env:BASE_VERSION
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./updater/tools/ci/package.ps1 -PayloadRoot $env:PAYLOAD_ROOT -UiSource "$env:GITHUB_WORKSPACE/ui-source" -BrowserSource "$env:GITHUB_WORKSPACE/browser-source" -ReleaseSource "$env:GITHUB_WORKSPACE/release-source"
       - name: Upload complete stable release assets
         uses: actions/upload-artifact@v7.0.2
@@ -87,13 +91,10 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
-      - name: Upload packaging evidence
-        if: always()
+      - name: Upload structured packaging provenance
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: krypton-installer-logs-${{ github.run_attempt }}
-          path: |
-            updater/out/ci/*.log
-            ${{ runner.temp }}/krypton-package/dist/build-info.json
+          name: krypton-installer-provenance-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/krypton-package/dist/build-info.json
           if-no-files-found: ignore
           retention-days: 14

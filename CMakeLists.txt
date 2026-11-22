@@ -161,6 +161,9 @@ target_link_libraries(kr_updater_common PUBLIC
   taskschd.lib
 )
 kr_apply_compile_options(kr_updater_common)
+if(KR_BUILD_TESTS)
+  target_compile_definitions(kr_updater_common PRIVATE KR_UPDATER_TEST_SEAMS)
+endif()
 target_compile_definitions(kr_updater_common PRIVATE
   KR_ZUCCHINI_SHA256="${KR_ZUCCHINI_SHA256}")
 

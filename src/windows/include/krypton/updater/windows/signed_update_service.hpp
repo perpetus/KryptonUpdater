@@ -10,6 +10,7 @@ struct BackgroundUpdateOptions {
   bool download_only{};
   bool apply_pending{};
   bool worker{};
+  bool browser_start{};
   bool require_delta{};
   std::filesystem::path release_file;
 };

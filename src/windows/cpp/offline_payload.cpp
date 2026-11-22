@@ -1,8 +1,9 @@
 #include "krypton/updater/windows/offline_payload.hpp"
 #include "krypton/updater/windows/resource_ids.h"
 
-#include <fstream>
-#include <random>
+#include "krypton/updater/windows/locked_file.hpp"
+
+#include <algorithm>
 #include <windows.h>
 
 namespace kr::updater::windows {
@@ -86,9 +87,10 @@ PayloadType OfflinePayload::DetectEmbeddedType() noexcept {
   return DetectType(GetEmbeddedData());
 }
 
-std::optional<std::filesystem::path> OfflinePayload::ExtractToTempFile() {
+std::optional<std::filesystem::path>
+OfflinePayload::ExtractToFile(const std::filesystem::path &workspace) {
   auto data = GetEmbeddedData();
-  if (data.empty())
+  if (data.empty() || !VersionManager::IsPlainDirectory(workspace))
     return std::nullopt;
 
   auto type = DetectType(data);
@@ -102,23 +104,23 @@ std::optional<std::filesystem::path> OfflinePayload::ExtractToTempFile() {
   else if (type == PayloadType::kExe)
     ext = ".exe";
 
-  std::error_code ec;
-  auto temp_dir = std::filesystem::temp_directory_path(ec) / "KryptonInstall";
-  std::filesystem::create_directories(temp_dir, ec);
-
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint32_t> dis(100000, 999999);
-
-  auto temp_path = temp_dir / std::format("payload_{}{}", dis(gen), ext);
-  std::ofstream out(temp_path, std::ios::binary);
-  if (!out)
+  const auto path = workspace / std::string("payload").append(ext);
+  ScopedFileHandle file(CreateFileW(
+      path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (file.get() == INVALID_HANDLE_VALUE)
     return std::nullopt;
 
-  out.write(reinterpret_cast<const char *>(data.data()), data.size());
-  out.close();
-
-  return temp_path;
+  constexpr std::size_t kChunkSize = 1024 * 1024;
+  while (!data.empty()) {
+    const auto size = static_cast<DWORD>(std::min(data.size(), kChunkSize));
+    DWORD written = 0;
+    if (!WriteFile(file.get(), data.data(), size, &written, nullptr) ||
+        written != size)
+      return std::nullopt;
+    data = data.subspan(written);
+  }
+  return path;
 }
 
 } // namespace kr::updater::windows

@@ -256,7 +256,11 @@ struct WinUIInstallerWindow::Impl {
   std::unique_ptr<Gdiplus::Bitmap> logo_bitmap;
   std::unique_ptr<Gdiplus::Bitmap> caption_bitmap;
   std::thread worker_thread;
-  int exit_code{0};
+  int exit_code{1};
+  bool close_requested{false};
+  bool apartment_initialized{false};
+  std::atomic<bool> status_posted{false};
+  static constexpr UINT kWorkerFinished = WM_APP + 2;
 
   // State
   std::mutex ui_mutex;
@@ -267,9 +271,9 @@ struct WinUIInstallerWindow::Impl {
   float animated_progress{0.0f};
   bool is_started{false};
   bool is_uninstall{false};
-  bool is_completed{false};
+  std::atomic<bool> is_completed{false};
   bool is_resumed{false};
-  bool has_error{false};
+  std::atomic<bool> has_error{false};
   bool modal_cancel_open{false};
   bool is_xaml_active{false};
   bool is_mica_active{false};
@@ -634,6 +638,62 @@ struct WinUIInstallerWindow::Impl {
     root_grid.Children().Append(caption);
   }
 
+  void RequestClose(bool cancel) {
+    if (!worker_thread.joinable()) {
+      PostQuitMessage(exit_code);
+      return;
+    }
+    close_requested = true;
+    if (cancel && engine)
+      engine->Cancel();
+  }
+
+  void NotifyStatus() {
+    if (hwnd && !status_posted.exchange(true) &&
+        !PostMessageW(hwnd, WM_USER + 1, 0, 0))
+      status_posted = false;
+  }
+
+  void ReleaseXaml() noexcept {
+    is_xaml_active = false;
+    if (xaml_source) {
+      try {
+        xaml_source.Content(nullptr);
+      } catch (const winrt::hresult_error &) {
+        // The island can already be closed by the platform.
+      }
+    }
+    xaml_cancel_dialog = nullptr;
+    xaml_adv_dialog = nullptr;
+    xaml_cancel_install_btn = nullptr;
+    xaml_launch_btn = nullptr;
+    xaml_adv_btn = nullptr;
+    xaml_unlock_btn = nullptr;
+    xaml_progress_fill = nullptr;
+    xaml_progress_container = nullptr;
+    xaml_subtitle = nullptr;
+    xaml_headline = nullptr;
+    logo_surface = nullptr;
+    logo_card = nullptr;
+    window_acrylic = nullptr;
+    root_grid = nullptr;
+    if (xaml_source) {
+      try {
+        xaml_source.Close();
+      } catch (const winrt::hresult_error &) {
+      }
+      xaml_source = nullptr;
+    }
+    if (xaml_manager) {
+      try {
+        xaml_manager.Close();
+      } catch (const winrt::hresult_error &) {
+      }
+      xaml_manager = nullptr;
+    }
+    xaml_hwnd = nullptr;
+  }
+
   void StartInstallation() {
     if (is_started)
       return;
@@ -661,10 +721,10 @@ struct WinUIInstallerWindow::Impl {
       InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    worker_thread = std::thread([this]() {
-      if (engine) {
-        exit_code = engine->Execute();
-      }
+    SetTimer(hwnd, 1, 16, nullptr);
+    worker_thread = std::thread([this, window = hwnd] {
+      exit_code = engine ? engine->Execute() : 1;
+      PostMessageW(window, kWorkerFinished, 0, 0);
     });
   }
 
@@ -927,7 +987,7 @@ struct WinUIInstallerWindow::Impl {
           ShellExecuteW(nullptr, L"open", launcher.c_str(), nullptr, nullptr,
                         SW_SHOW);
       }
-      PostQuitMessage(0);
+      RequestClose(false);
     });
     panel.Children().Append(xaml_launch_btn);
 
@@ -1090,9 +1150,7 @@ struct WinUIInstallerWindow::Impl {
     StyleDialogButton(cancel_installation, false);
     cancel_installation.Click([this](auto const &, auto const &) {
       xaml_cancel_dialog.Hide();
-      if (engine)
-        engine->Cancel();
-      PostQuitMessage(1);
+      RequestClose(true);
     });
     cancel_actions.Children().Append(cancel_installation);
     cancel_panel.Children().Append(cancel_actions);
@@ -1135,10 +1193,10 @@ struct WinUIInstallerWindow::Impl {
   }
 
   void PromptCancelConfirmation() {
-    if (modal_cancel_open)
+    if (modal_cancel_open || close_requested)
       return;
     if (is_completed || has_error || !is_started) {
-      PostQuitMessage(0);
+      RequestClose(false);
       return;
     }
     if (is_xaml_active && xaml_cancel_dialog) {
@@ -1156,9 +1214,7 @@ struct WinUIInstallerWindow::Impl {
                                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
     modal_cancel_open = false;
     if (answer == IDYES) {
-      if (engine)
-        engine->Cancel();
-      PostQuitMessage(1);
+      RequestClose(true);
     }
   }
 
@@ -1191,7 +1247,6 @@ struct WinUIInstallerWindow::Impl {
       self = reinterpret_cast<Impl *>(cs->lpCreateParams);
       SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
       self->hwnd = hwnd;
-      SetTimer(hwnd, 1, 16, nullptr); // 60 FPS animation timer
       return 0;
     }
 
@@ -1332,7 +1387,7 @@ struct WinUIInstallerWindow::Impl {
                    self->unlock_btn_rect.Contains(pt)) {
           self->StartInstallation();
         } else if (self->is_started && !self->is_completed &&
-                   (!self->is_uninstall && self->adv_btn_rect.Contains(pt))) {
+                   self->adv_btn_rect.Contains(pt)) {
           self->PromptCancelConfirmation();
         } else if (!self->is_started &&
                    (!self->is_uninstall && self->adv_btn_rect.Contains(pt))) {
@@ -1351,7 +1406,7 @@ struct WinUIInstallerWindow::Impl {
               ShellExecuteW(nullptr, L"open", launcher.c_str(), nullptr,
                             nullptr, SW_SHOW);
           }
-          PostQuitMessage(0);
+          self->RequestClose(false);
         }
         self->unlock_pressed = false;
         self->launch_pressed = false;
@@ -1374,12 +1429,19 @@ struct WinUIInstallerWindow::Impl {
 
     case WM_USER + 1: { // UI state change dispatch
       if (self) {
-        std::lock_guard lock(self->ui_mutex);
+        self->status_posted = false;
+        std::wstring headline;
+        std::wstring stage;
+        {
+          std::lock_guard lock(self->ui_mutex);
+          headline = self->headline_text;
+          stage = self->stage_text;
+        }
         if (self->is_xaml_active) {
           if (self->xaml_headline)
-            self->xaml_headline.Text(self->headline_text);
+            self->xaml_headline.Text(headline);
           if (self->xaml_subtitle)
-            self->xaml_subtitle.Text(self->stage_text);
+            self->xaml_subtitle.Text(stage);
           if (self->has_error && self->xaml_cancel_install_btn) {
             self->xaml_cancel_install_btn.Content(
                 winrt::box_value(winrt::hstring(L"Close")));
@@ -1401,8 +1463,16 @@ struct WinUIInstallerWindow::Impl {
       return 0;
     }
 
+    case kWorkerFinished:
+      if (self && self->worker_thread.joinable()) {
+        self->worker_thread.join();
+        KillTimer(hwnd, 1);
+        if (self->close_requested)
+          PostQuitMessage(self->exit_code);
+      }
+      return 0;
     case WM_DESTROY:
-      PostQuitMessage(0);
+      KillTimer(hwnd, 1);
       return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1532,6 +1602,13 @@ struct WinUIInstallerWindow::Impl {
           g.DrawImage(logo_bitmap.get(), img_x, img_y, img_size, img_size);
         }
 
+        std::wstring headline;
+        std::wstring stage;
+        {
+          std::lock_guard lock(ui_mutex);
+          headline = headline_text;
+          stage = stage_text;
+        }
         // Headline Text
         float text_top = s_y + s_card + (20.0f * dpi_scale);
         Gdiplus::Font h_font(L"Segoe UI Semibold", 26.0f * dpi_scale,
@@ -1543,7 +1620,7 @@ struct WinUIInstallerWindow::Impl {
                               34.0f * dpi_scale);
         Gdiplus::StringFormat center_fmt;
         center_fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
-        g.DrawString(headline_text.c_str(), -1, &h_font, h_rect, &center_fmt,
+        g.DrawString(headline.c_str(), -1, &h_font, h_rect, &center_fmt,
                      &text_dark);
 
         // Stage Subtitle
@@ -1556,7 +1633,7 @@ struct WinUIInstallerWindow::Impl {
         Gdiplus::RectF s_rect_box(
             24.0f * dpi_scale, sub_top,
             static_cast<float>(width) - (48.0f * dpi_scale), 36.0f * dpi_scale);
-        g.DrawString(stage_text.c_str(), -1, &s_font, s_rect_box, &center_fmt,
+        g.DrawString(stage.c_str(), -1, &s_font, s_rect_box, &center_fmt,
                      &text_muted);
 
         if (!is_started) {
@@ -1669,12 +1746,13 @@ WinUIInstallerWindow::~WinUIInstallerWindow() {
   if (impl_->worker_thread.joinable()) {
     impl_->worker_thread.join();
   }
-  if (impl_->xaml_source) {
-    impl_->xaml_source.Close();
-  }
-  if (impl_->xaml_manager) {
-    impl_->xaml_manager.Close();
-  }
+  if (impl_->engine)
+    impl_->engine->SetObserver(nullptr);
+  impl_->ReleaseXaml();
+  if (impl_->apartment_initialized)
+    winrt::uninit_apartment();
+  impl_->logo_bitmap.reset();
+  impl_->caption_bitmap.reset();
   if (impl_->app_icon_small) {
     DestroyIcon(impl_->app_icon_small);
   }
@@ -1749,9 +1827,14 @@ int WinUIInstallerWindow::RunModal() {
 
   // Attempt to initialize in-box System XAML Island hosting (Layer 2
   // Resiliency)
-  if (IsSystemXamlSupported()) {
+  try {
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
+    impl_->apartment_initialized = true;
+  } catch (const winrt::hresult_error &) {
+    // The native fallback remains available without XAML.
+  }
+  if (impl_->apartment_initialized && IsSystemXamlSupported()) {
     try {
-      winrt::init_apartment(winrt::apartment_type::single_threaded);
       impl_->xaml_manager =
           hosting::WindowsXamlManager::InitializeForCurrentThread();
       impl_->xaml_source = hosting::DesktopWindowXamlSource();
@@ -1795,7 +1878,8 @@ int WinUIInstallerWindow::RunModal() {
   UpdateWindow(hwnd);
 
   MSG msg{};
-  while (GetMessageW(&msg, nullptr, 0, 0)) {
+  BOOL message_result;
+  while ((message_result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
     // Keep native host commands local; forward island input and keyboard
     // navigation.
     const bool keyboard_message =
@@ -1815,7 +1899,14 @@ int WinUIInstallerWindow::RunModal() {
     DispatchMessageW(&msg);
   }
 
-  return static_cast<int>(msg.wParam);
+  if (impl_->worker_thread.joinable()) {
+    if (impl_->engine)
+      impl_->engine->Cancel();
+    impl_->worker_thread.join();
+  }
+  impl_->ReleaseXaml();
+  DestroyWindow(hwnd);
+  return message_result < 0 ? 1 : impl_->exit_code;
 }
 
 void WinUIInstallerWindow::SetResumed(bool resumed) {
@@ -1856,8 +1947,7 @@ void WinUIInstallerWindow::OnStateChanged(UpdateState state) {
           GetDynamicStageText(state, impl_->target_progress, impl_->is_resumed);
     }
   }
-  if (impl_->hwnd)
-    PostMessageW(impl_->hwnd, WM_USER + 1, 0, 0);
+  impl_->NotifyStatus();
 }
 
 void WinUIInstallerWindow::OnProgress(const ProgressReport &progress) {
@@ -1873,8 +1963,7 @@ void WinUIInstallerWindow::OnProgress(const ProgressReport &progress) {
             : GetDynamicStageText(impl_->current_state, progress.fraction,
                                   impl_->is_resumed);
   }
-  if (impl_->hwnd)
-    PostMessageW(impl_->hwnd, WM_USER + 1, 0, 0);
+  impl_->NotifyStatus();
 }
 
 void WinUIInstallerWindow::OnSecurityAlert(const SecurityAlert &alert) {
@@ -1884,9 +1973,7 @@ void WinUIInstallerWindow::OnSecurityAlert(const SecurityAlert &alert) {
         std::format(L"Security Alert: {}",
                     std::wstring(alert.reason.begin(), alert.reason.end()));
   }
-  if (impl_->hwnd) {
-    PostMessageW(impl_->hwnd, WM_USER + 1, 0, 0);
-  }
+  impl_->NotifyStatus();
 }
 
 void WinUIInstallerWindow::OnError(std::string_view message) {
@@ -1897,9 +1984,7 @@ void WinUIInstallerWindow::OnError(std::string_view message) {
     impl_->stage_text =
         std::format(L"{}", std::wstring(message.begin(), message.end()));
   }
-  if (impl_->hwnd) {
-    PostMessageW(impl_->hwnd, WM_USER + 1, 0, 0);
-  }
+  impl_->NotifyStatus();
 }
 
 } // namespace kr::updater::windows

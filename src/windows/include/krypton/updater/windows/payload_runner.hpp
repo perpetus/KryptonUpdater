@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <string>
 
+#include "krypton/updater/windows/locked_file.hpp"
+
 namespace kr::updater::windows {
 
 class PayloadRunner {
@@ -15,10 +17,11 @@ class PayloadRunner {
       std::uint32_t* out_exit_code = nullptr);
 
   // Runs an external EXE installer silently
-  [[nodiscard]] static bool RunExe(
-      const std::filesystem::path& exe_path,
-      const std::wstring& arguments = L"/SILENT /NORESTART",
-      std::uint32_t* out_exit_code = nullptr);
+  [[nodiscard]] static bool
+  RunExe(const std::filesystem::path &exe_path,
+         const std::wstring &arguments = L"/SILENT /NORESTART",
+         std::uint32_t *out_exit_code = nullptr,
+         ScopedFileHandle verification_lock = {});
 };
 
 }  // namespace kr::updater::windows

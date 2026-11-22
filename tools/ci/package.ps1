@@ -8,6 +8,8 @@ param(
 
 # This pipeline creates artifacts only. Publishing an update is separate.
 $ErrorActionPreference = 'Stop'
+$hostedKey = [Environment]::GetEnvironmentVariable('KRYPTON_RELEASE_KEY_PKCS8', 'Process')
+[Environment]::SetEnvironmentVariable('KRYPTON_RELEASE_KEY_PKCS8', $null, 'Process')
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Use this entry point on the protected signing runner.' }
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $payload = (Resolve-Path -LiteralPath $PayloadRoot).Path
@@ -25,7 +27,7 @@ if ($version -ne $record.product_version -or $version -notmatch '^\d+\.\d+\.\d+\
 }
 $key = if ($env:KRYPTON_RELEASE_KEY_PATH) { $env:KRYPTON_RELEASE_KEY_PATH }
   else { Join-Path $env:USERPROFILE '.krypton/signing/release-key.dpapi' }
-if (-not $env:KRYPTON_RELEASE_KEY_PKCS8 -and -not (Test-Path -LiteralPath $key)) { throw 'The existing release signing key is required.' }
+if (-not $hostedKey -and -not (Test-Path -LiteralPath $key)) { throw 'The existing release signing key is required.' }
 $ninja = (Get-Command $(if ($env:KRYPTON_NINJA) { $env:KRYPTON_NINJA } else { 'ninja.exe' }) -ErrorAction Stop).Source
 $ninjaVersion = & $ninja --version
 if ($LASTEXITCODE -ne 0 -or $ninjaVersion -ne '1.13.2') { throw 'Native Ninja 1.13.2 is required.' }
@@ -63,6 +65,16 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
   if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE." }
 }
 
+function Invoke-Signing([string]$Program, [string[]]$Arguments, [string]$InputFlag, [string]$KeyFlag) {
+  # This is the only invocation that receives hosted signing input.
+  # Keep signing diagnostics out of the runner log and artifacts.
+  if ($hostedKey) {
+    $hostedKey | & $Program @Arguments $InputFlag 2>&1 | Out-Null
+  } else {
+    & $Program @Arguments $KeyFlag $key 2>&1 | Out-Null
+  }
+  if ($LASTEXITCODE -ne 0) { throw "The protected signing step failed for $Program." }
+}
 Push-Location -LiteralPath $root
 try {
   $common = @("-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninja", '-DKR_BUILD_TESTS=OFF',
@@ -75,10 +87,9 @@ try {
   $prerequisites = Join-Path $work 'prerequisites'
   Invoke-Checked pwsh @('-NoProfile', 'tools/prepare-prerequisites.ps1', '-BrowserDir', $browser,
     '-OutputDir', $prerequisites, '-KryptonUiDir', $UiSource, '-UiBinary', "$runtime/krypton_ui.dll")
-  Invoke-Checked python @('tools/package-browser.py', 'stage', '--browser-dir', $browser,
+  Invoke-Signing python @('tools/package-browser.py', 'stage', '--browser-dir', $browser,
     '--work-dir', $work, '--uninstaller', "$online/bin/Release/KryptonUninstaller.exe",
-    '--updater', "$online/bin/Release/KryptonUpdater.exe", '--prerequisites-dir', $prerequisites,
-    '--key-path', $key)
+    '--updater', "$online/bin/Release/KryptonUpdater.exe", '--prerequisites-dir', $prerequisites) '--signing-key-stdin' '--key-path'
   $packageJson = Join-Path $work 'package.json'
   $package = Get-Content -LiteralPath $packageJson -Raw | ConvertFrom-Json
   if ($package.browser_version -ne $version) { throw 'Packaged browser version mismatch.' }
@@ -91,7 +102,7 @@ try {
   Copy-Item -LiteralPath "$offline/bin/Release/KryptonSetup.exe" -Destination $setup
   Copy-Item -LiteralPath "$online/bin/Release/KryptonWebSetup.exe" -Destination $web
   foreach ($file in @($setup, $web)) {
-    Invoke-Checked pwsh @('-NoProfile', 'tools/release-signing.ps1', 'sign', '-InputFile', $file, '-KeyPath', $key)
+    Invoke-Signing pwsh @('-NoProfile', 'tools/release-signing.ps1', 'sign', '-InputFile', $file) '-ReadKeyFromStdin' '-KeyPath'
     Invoke-Checked pwsh @('-NoProfile', 'tools/release-signing.ps1', 'verify', '-InputFile', $file)
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -LiteralPath "$file.sha256" -Encoding ascii
@@ -102,8 +113,9 @@ try {
     Copy-Item -LiteralPath "$online/bin/Release/$helper" -Destination (Join-Path $output $helper)
     Copy-Item -LiteralPath "$online/bin/Release/$helper.sig" -Destination (Join-Path $output "$helper.sig")
   }
-  Invoke-Checked python @('tools/prepare-release.py', '--package-json', $packageJson,
-    '--output-dir', "$output/github", '--key-path', $key, '--zucchini', "$browser/KryptonPatch.exe")
+  Invoke-Signing python @('tools/prepare-release.py', '--package-json', $packageJson,
+    '--output-dir', "$output/github", '--zucchini', "$browser/KryptonPatch.exe") '--signing-key-stdin' '--key-path'
+  $hostedKey = $null
   Invoke-Checked python @("$ReleaseSource/tools/stage-release.py", '--updater-root', $root,
     '--browser-root', $BrowserSource, '--ui-root', $UiSource, '--ui-binary', "$runtime/krypton_ui.dll",
     '--dist-dir', $output, '--release-type', 'stable')
@@ -111,4 +123,4 @@ try {
     source_run_id = $record.run_id; updater_commit = (& git rev-parse HEAD) } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'build-info.json') -Encoding utf8NoBOM
 }
-finally { Pop-Location }
+finally { $hostedKey = $null; Pop-Location }

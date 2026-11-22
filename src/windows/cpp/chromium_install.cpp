@@ -2,8 +2,8 @@
 
 #include "krypton/updater/release_manifest.hpp"
 
-#include "krypton/updater/windows/authenticode_verifier.hpp"
 #include "krypton/updater/windows/legacy_uninstall.hpp"
+#include "krypton/updater/windows/locked_file.hpp"
 #include "krypton/updater/windows/payload_runner.hpp"
 #include "krypton/updater/windows/release_security.hpp"
 
@@ -25,23 +25,23 @@ namespace {
 constexpr wchar_t kUninstallKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Krypton Krypton";
 
-bool VerifyNativeSetup(const std::filesystem::path &setup,
-                       const std::filesystem::path &metadata) {
+ScopedFileHandle VerifyNativeSetup(const std::filesystem::path &setup,
+                                   const std::filesystem::path &metadata) {
+  auto lock = LockFileForVerification(setup);
+  const auto marker_lock = LockFileForVerification(metadata);
   auto signature = metadata;
   signature += ".sig";
-  if (std::filesystem::exists(metadata)) {
-    if (!VerifyReleaseFile(metadata, signature))
-      return false;
-    wchar_t expected[65]{};
-    GetPrivateProfileStringW(L"Package", L"SetupSha256", L"", expected, 65,
-                             metadata.c_str());
-    const auto actual = Sha256File(setup);
-    return actual && std::wstring(actual->begin(), actual->end()) == expected;
-  }
-  AuthenticodeOptions options;
-  options.require_trusted_signature = true;
-  return AuthenticodeVerifier::Verify(setup, options) ==
-         SignatureStatus::kValidAndTrusted;
+  if (!lock || !marker_lock || !VerifyReleaseFile(metadata, signature))
+    return {};
+
+  wchar_t expected[65]{};
+  if (GetPrivateProfileStringW(L"Package", L"SetupSha256", L"", expected,
+                               std::size(expected), metadata.c_str()) != 64)
+    return {};
+  const auto actual = Sha256File(setup);
+  if (!actual || std::wstring(actual->begin(), actual->end()) != expected)
+    return {};
+  return lock;
 }
 
 std::wstring ReadRegistration(const wchar_t *value) {
@@ -73,8 +73,9 @@ bool WriteRegistration(const wchar_t *name, const std::wstring &value) {
 void RetryOldVersionCleanup(const ChromiumInstallation &installed) {
   const auto setup =
       installed.application / installed.version / "Installer/setup.exe";
-  if (!VerifyNativeSetup(setup,
-                         setup.parent_path() / "KryptonPackage.manifest"))
+  const auto setup_lock =
+      VerifyNativeSetup(setup, setup.parent_path() / "KryptonPackage.manifest");
+  if (!setup_lock)
     return;
   // Chromium owns old-version selection, in-use checks, and bounded retries.
   // Run independently so a locked old version cannot delay setup completion.
@@ -235,7 +236,9 @@ InstallChromiumBrowser(const std::filesystem::path &package,
       !std::filesystem::is_regular_file(archive))
     return std::unexpected(
         "The native Chromium installation package is incomplete.");
-  if (!VerifyNativeSetup(setup, package / "KryptonPackage.manifest"))
+  auto setup_lock =
+      VerifyNativeSetup(setup, package / "KryptonPackage.manifest");
+  if (!setup_lock)
     return std::unexpected(
         "Krypton's native setup signature could not be verified.");
   const auto preferences = package / "initial_preferences.json";
@@ -253,8 +256,9 @@ InstallChromiumBrowser(const std::filesystem::path &package,
           "Could not write the browser installation preferences.");
   }
   std::uint32_t exit_code = 0;
-  if (!PayloadRunner::RunExe(
-          setup, ChromiumInstallArguments(archive, preferences), &exit_code)) {
+  if (!PayloadRunner::RunExe(setup,
+                             ChromiumInstallArguments(archive, preferences),
+                             &exit_code, std::move(setup_lock))) {
     switch (exit_code) {
     case 4:
       return std::unexpected("A newer version of Krypton is already installed. "
@@ -309,12 +313,14 @@ UninstallChromiumBrowser(const std::filesystem::path &requested_root) {
         "No standard Krypton installation was found for this user.");
   const auto setup =
       installed->application / installed->version / "Installer/setup.exe";
-  if (!VerifyNativeSetup(setup,
-                         setup.parent_path() / "KryptonPackage.manifest"))
+  auto setup_lock =
+      VerifyNativeSetup(setup, setup.parent_path() / "KryptonPackage.manifest");
+  if (!setup_lock)
     return std::unexpected(
         "Krypton's native uninstaller signature could not be verified.");
   std::uint32_t exit_code = 0;
-  if (!PayloadRunner::RunExe(setup, ChromiumUninstallArguments(), &exit_code))
+  if (!PayloadRunner::RunExe(setup, ChromiumUninstallArguments(), &exit_code,
+                             std::move(setup_lock)))
     return std::unexpected(
         std::format("Krypton could not be removed (code {}). Close its browser "
                     "windows and try again.",

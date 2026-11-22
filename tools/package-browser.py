@@ -11,13 +11,8 @@ import shutil
 import struct
 import subprocess
 
+from release_signing import add_key_arguments, read_signing_key, signature
 
-def sign(path, key_path=None):
-    command = ["pwsh", "-NoProfile", "-File", str(Path(__file__).with_name("release-signing.ps1")),
-               "sign", "-InputFile", str(path)]
-    if key_path:
-        command += ["-KeyPath", str(key_path)]
-    subprocess.run(command, check=True)
 
 
 def digest(path):
@@ -108,6 +103,7 @@ def extract_resource(executable, resource_id, destination):
 
 
 def stage(args):
+    hosted_key = read_signing_key(args.signing_key_stdin)
     browser = args.browser_dir.resolve(strict=True)
     work = args.work_dir.resolve(strict=True)
     payload = work / "payload"
@@ -212,14 +208,14 @@ def stage(args):
         if notice.is_file():
             copy(notice, version / "Installer/Licenses" / notice.name)
     for helper in (args.updater, args.uninstaller):
-        sign(helper, args.key_path)
+        signature("sign", helper, args.key_path, hosted_key)
         copy(Path(str(helper) + ".sig"), version / "Installer" / (helper.name + ".sig"))
     copy(browser / "setup.exe", payload / "setup.exe")
     (version / "Installer/KryptonPackage.manifest").write_text(
         f"[Package]\nVersion={browser_version}\nEngineVersion={engine_version}\nSetupSha256={digest(payload / 'setup.exe')}\n",
         encoding="ascii")
     marker = version / "Installer/KryptonPackage.manifest"
-    sign(marker, args.key_path)
+    signature("sign", marker, args.key_path, hosted_key)
     copy(marker, payload / marker.name)
     copy(Path(str(marker) + ".sig"), payload / (marker.name + ".sig"))
     license_file = browser.parents[1] / "LICENSE"
@@ -257,7 +253,7 @@ def stage(args):
     archive = work / "browser.7z"
     manifest = Path(str(archive) + ".manifest.json")
     manifest.write_text(json.dumps({"version": install_version, "files": files}, indent=2), encoding="utf-8")
-    sign(manifest, args.key_path)
+    signature("sign", manifest, args.key_path, hosted_key)
     subprocess.run([args.seven_zip, "a", "-t7z", "-mx=3", "-ms=off", "-mmt=8", "-y",
                     str(archive), "."], cwd=payload, check=True, stdout=subprocess.DEVNULL)
     subprocess.run([args.seven_zip, "t", str(archive)], check=True, stdout=subprocess.DEVNULL)
@@ -278,7 +274,7 @@ def main():
     for name in ("browser-dir", "work-dir", "uninstaller", "updater", "prerequisites-dir"):
         staging.add_argument("--" + name, type=Path, required=True)
     staging.add_argument("--seven-zip", default="7z")
-    staging.add_argument("--key-path", type=Path)
+    add_key_arguments(staging)
     verification = commands.add_parser("verify-embedded")
     verification.add_argument("--installer", type=Path, required=True)
     verification.add_argument("--package-json", type=Path, required=True)

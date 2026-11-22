@@ -9,17 +9,59 @@
 // clang-format off
 #include <windows.h>
 #include <objbase.h>
+#include <sddl.h>
 // clang-format on
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
 namespace kr::updater::windows {
 namespace {
 namespace fs = std::filesystem;
+
+ScopedFileHandle LockPlainDirectory(const fs::path &path) {
+  ScopedFileHandle directory(CreateFileW(
+      path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  if (directory.get() == INVALID_HANDLE_VALUE ||
+      !GetFileInformationByHandleEx(directory.get(), FileAttributeTagInfo,
+                                    &attributes, sizeof(attributes)) ||
+      (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+      !(attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+    return {};
+  return directory;
+}
+
+std::unique_ptr<void, decltype(&LocalFree)> PrivateDirectoryAcl() {
+  const auto token = GetCurrentProcessToken();
+  DWORD bytes = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+  if (!bytes)
+    return {nullptr, LocalFree};
+  std::vector<std::byte> user(bytes);
+  if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes))
+    return {nullptr, LocalFree};
+
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(
+          reinterpret_cast<const TOKEN_USER *>(user.data())->User.Sid, &sid))
+    return {nullptr, LocalFree};
+  const std::unique_ptr<wchar_t, decltype(&LocalFree)> sid_owner(sid,
+                                                                 LocalFree);
+  const std::wstring acl = std::wstring(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;") +
+                           sid_owner.get() + L")";
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          acl.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
+    return {nullptr, LocalFree};
+  return {descriptor, LocalFree};
+}
 bool Digest(std::wstring_view name) {
   return name.size() == 64 && std::ranges::all_of(name, [](wchar_t ch) {
            return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f');
@@ -142,12 +184,15 @@ void CleanupStaging(const fs::path &application) {
 }
 } // namespace
 
-TemporaryInstallDirectory::TemporaryInstallDirectory(fs::path path)
-    : path_(std::move(path)) {}
+TemporaryInstallDirectory::TemporaryInstallDirectory(
+    fs::path path, ScopedFileHandle directory_lock)
+    : path_(std::move(path)), directory_lock_(std::move(directory_lock)) {}
 TemporaryInstallDirectory::TemporaryInstallDirectory(
     TemporaryInstallDirectory &&other) noexcept
-    : path_(std::exchange(other.path_, {})) {}
+    : path_(std::exchange(other.path_, {})),
+      directory_lock_(std::move(other.directory_lock_)) {}
 TemporaryInstallDirectory::~TemporaryInstallDirectory() {
+  directory_lock_.reset();
   try {
     if (!path_.empty())
       (void)VersionManager::RemoveOwnedDirectory(path_.parent_path(), path_);
@@ -161,8 +206,11 @@ TemporaryInstallDirectory::Create() {
       GetTempPathW(static_cast<DWORD>(temporary.size()), temporary.data());
   if (!length || length >= temporary.size())
     return std::unexpected("Could not find the installer temporary directory.");
-  const fs::path parent = fs::path(temporary.data()).lexically_normal();
-  if (!VersionManager::IsPlainDirectory(parent))
+  auto parent = fs::path(temporary.data()).lexically_normal();
+  if (!parent.has_filename() && parent != parent.root_path())
+    parent = parent.parent_path();
+  const auto parent_lock = LockPlainDirectory(parent);
+  if (!parent_lock || !VersionManager::IsPlainDirectory(parent))
     return std::unexpected(
         "The installer temporary directory is not a regular directory.");
   Children(parent, [&](const fs::directory_entry &entry) {
@@ -181,9 +229,16 @@ TemporaryInstallDirectory::Create() {
         "Could not create an installer workspace identifier.");
   const auto directory =
       parent / (std::wstring(L"KryptonSetup-") + name.data());
-  if (!CreateDirectoryW(directory.c_str(), nullptr))
+  const auto descriptor = PrivateDirectoryAcl();
+  if (!descriptor)
+    return std::unexpected("Could not secure the installer workspace.");
+  SECURITY_ATTRIBUTES security{sizeof(security), descriptor.get(), FALSE};
+  if (!CreateDirectoryW(directory.c_str(), &security))
     return std::unexpected("Could not create the installer workspace.");
-  return TemporaryInstallDirectory(directory);
+  auto lock = LockPlainDirectory(directory);
+  if (!lock || !VersionManager::IsPlainDirectory(directory))
+    return std::unexpected("Could not verify the installer workspace.");
+  return TemporaryInstallDirectory(directory, std::move(lock));
 }
 void CleanupInstallArtifacts(const fs::path &application,
                              std::string_view installed_package) noexcept {

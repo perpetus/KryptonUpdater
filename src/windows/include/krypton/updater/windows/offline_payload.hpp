@@ -40,7 +40,8 @@ public:
   [[nodiscard]] static PayloadType DetectEmbeddedType() noexcept;
 
   // Extracts embedded data to a temporary file and returns its path
-  [[nodiscard]] static std::optional<std::filesystem::path> ExtractToTempFile();
+  [[nodiscard]] static std::optional<std::filesystem::path>
+  ExtractToFile(const std::filesystem::path &workspace);
 };
 
 } // namespace kr::updater::windows

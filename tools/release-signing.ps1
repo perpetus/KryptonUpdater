@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][ValidateSet('create-key', 'sign', 'verify')][string]$Command,
+  [switch]$ReadKeyFromStdin,
   [string]$KeyPath = (Join-Path $env:USERPROFILE '.krypton/signing/release-key.dpapi'),
   [string]$InputFile,
   [string]$SignatureFile,
@@ -64,10 +65,14 @@ try {
   if (-not $SignatureFile) { $SignatureFile = "$InputFile.sig" }
   $signingStream = [IO.File]::OpenRead((Resolve-Path -LiteralPath $InputFile).Path)
   if ($Command -eq 'sign') {
-    # Hosted release jobs receive the existing key through an environment secret.
-    # Local signing keeps the account-bound DPAPI path; the trust key is unchanged.
-    [byte[]]$private = if ($env:KRYPTON_RELEASE_KEY_PKCS8) {
-      [Convert]::FromBase64String($env:KRYPTON_RELEASE_KEY_PKCS8)
+    # The hosted signer receives the key through its private input pipe.
+    # Local signing still reads the account-bound DPAPI key.
+    [byte[]]$private = if ($ReadKeyFromStdin) {
+      if ($PSBoundParameters.ContainsKey('KeyPath')) { throw 'Select one key source.' }
+      $encoded = [Console]::In.ReadLine()
+      if (-not $encoded -or $encoded.Length -gt 1024) { throw 'Invalid hosted signing key input.' }
+      try { [Convert]::FromBase64String($encoded) }
+      finally { $encoded = $null }
     } else {
       [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $KeyPath).Path), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
     }

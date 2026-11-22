@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 
+#include "krypton/updater/windows/locked_file.hpp"
+
 namespace kr::updater::windows {
 class TemporaryInstallDirectory {
 public:
@@ -21,8 +23,10 @@ public:
   }
 
 private:
-  explicit TemporaryInstallDirectory(std::filesystem::path path);
+  explicit TemporaryInstallDirectory(std::filesystem::path path,
+                                     ScopedFileHandle directory_lock);
   std::filesystem::path path_;
+  ScopedFileHandle directory_lock_;
 };
 
 // Best effort after a confirmed install, or while holding the update worker

@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <RestartManager.h>
+#include <netlistmgr.h>
 #include <Poco/JSON/Object.h>
 // clang-format on
 #include <algorithm>
@@ -24,6 +25,61 @@
 namespace kr::updater::windows {
 namespace {
 namespace fs = std::filesystem;
+
+bool IsMeteredConnection() {
+  const auto apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE)
+    return false;
+  const bool metered = [] {
+    INetworkCostManager *cost_manager = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(NetworkListManager), nullptr,
+                                CLSCTX_ALL, IID_PPV_ARGS(&cost_manager))))
+      return false;
+    const auto release = [](INetworkCostManager *manager) {
+      manager->Release();
+    };
+    const std::unique_ptr<INetworkCostManager, decltype(release)> manager(
+        cost_manager, release);
+    DWORD cost = NLM_CONNECTION_COST_UNKNOWN;
+    return SUCCEEDED(manager->GetCost(&cost, nullptr)) &&
+           cost != NLM_CONNECTION_COST_UNKNOWN &&
+           (cost & NLM_CONNECTION_COST_UNRESTRICTED) == 0;
+  }();
+  if (SUCCEEDED(apartment))
+    CoUninitialize();
+  return metered;
+}
+
+class ScopedDownloadEcoQoS {
+public:
+  explicit ScopedDownloadEcoQoS(bool enable) noexcept {
+    if (!enable)
+      return;
+    PROCESS_POWER_THROTTLING_STATE state{
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED};
+    enabled_ =
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                              &state, sizeof(state)) != FALSE;
+  }
+
+  ScopedDownloadEcoQoS(const ScopedDownloadEcoQoS &) = delete;
+  ScopedDownloadEcoQoS &operator=(const ScopedDownloadEcoQoS &) = delete;
+
+  ~ScopedDownloadEcoQoS() {
+    if (!enabled_)
+      return;
+    PROCESS_POWER_THROTTLING_STATE state{
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, 0, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+                          sizeof(state));
+  }
+
+private:
+  bool enabled_ = false;
+};
+
 fs::path Suffixed(fs::path path, const wchar_t *suffix) {
   path += suffix;
   return path;
@@ -158,6 +214,8 @@ RelaunchWorker(const fs::path &cache, const BackgroundUpdateOptions &options) {
                   options.check_only ? L" --check" : L"",
                   options.download_only ? L" --download-only" : L"",
                   options.apply_pending ? L" --apply-pending" : L"");
+  if (options.browser_start)
+    command += L" --browser-start";
   if (options.require_delta)
     command += L" --require-delta";
   if (!options.release_file.empty())
@@ -389,6 +447,15 @@ RunWorker(const BackgroundUpdateOptions &options,
   HttpDownloader http;
   auto pending = cache / "pending.signed";
   if (!options.apply_pending) {
+    const bool automatic_download =
+        options.browser_start && options.release_file.empty();
+    if (automatic_download && IsMeteredConnection()) {
+      constexpr auto message =
+          "Automatic update deferred on a metered connection.";
+      Status(cache, "deferred", 0, {}, message);
+      return message;
+    }
+    const ScopedDownloadEcoQoS eco_qos(automatic_download);
     const auto endpoint = std::format("https://github.com/{}/releases/latest/"
                                       "download/KryptonUpdate-win-x64.json",
                                       kReleaseRepository);
@@ -464,7 +531,8 @@ RunWorker(const BackgroundUpdateOptions &options,
         return std::unexpected(
             "The stored release checkpoint could not be verified.");
       const auto high_version = ParseBrowserVersion(highest->version);
-      if (release->sequence < highest->sequence || *next < *high_version ||
+      if (!high_version || release->sequence < highest->sequence ||
+          *next < *high_version ||
           (release->sequence == highest->sequence &&
            *bytes != std::string_view(*previous).substr(64)))
         return std::unexpected(
@@ -572,9 +640,16 @@ RunWorker(const BackgroundUpdateOptions &options,
     FinishRequestedRelaunch(cache, current_install->application);
     return "The staged update is no longer newer than the installed browser.";
   }
-  release = LoadRelease(pending);
-  if (!release)
-    return std::unexpected(release.error());
+  // Revalidate freshness and identity after waiting for the browser to close.
+  const auto refreshed = LoadRelease(pending);
+  if (!refreshed)
+    return std::unexpected(refreshed.error());
+  if (refreshed->version != release->version ||
+      refreshed->sequence != release->sequence ||
+      refreshed->full.sha256 != release->full.sha256)
+    return std::unexpected(
+        "The pending release changed while waiting to apply it.");
+  release = refreshed;
   if (!ExecutablesUnlocked(*current_install))
     return std::unexpected("Browser files are still locked. The update remains "
                            "staged for the next startup.");
