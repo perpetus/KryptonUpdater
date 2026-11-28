@@ -150,6 +150,13 @@ def stage(args):
                 if item.is_file():
                     copy(item, chrome / relative / item.name)
 
+    # Preserve the installer extension inventory when the distribution rules
+    # omit the default manifest.
+    extensions = version / "Extensions/external_extensions.json"
+    default_extensions = (browser.parents[1]
+                          / "chrome/browser/extensions/default_extensions/external_extensions.json")
+    if not extensions.is_file() and default_extensions.is_file():
+        copy(default_extensions, extensions)
     for name in ("krypton_ui.dll", "Microsoft.WindowsAppRuntime.Bootstrap.dll"):
         copy(browser / name, version / name)
     for name in ("hr_classic.png", "hr_compact.png", "hr_dyn.png", "vt_compact.png",
