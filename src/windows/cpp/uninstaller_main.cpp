@@ -35,9 +35,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   const std::filesystem::path own_path(executable);
   if (requested_root.empty()) {
     const auto own_parent = own_path.parent_path();
+    const auto version = own_parent.parent_path().filename().u8string();
     if (own_parent.filename() == L"Installer" &&
-        kr::updater::windows::IsChromiumVersion(
-            own_parent.parent_path().filename().string()))
+        kr::updater::windows::IsChromiumVersion(std::string(
+            reinterpret_cast<const char *>(version.data()), version.size())))
       requested_root = own_parent.parent_path().parent_path();
     else if (std::filesystem::is_regular_file(own_parent / "krypton.exe"))
       requested_root = own_parent;

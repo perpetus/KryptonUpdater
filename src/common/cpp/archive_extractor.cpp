@@ -18,6 +18,15 @@
 
 namespace kr::updater {
 namespace {
+// Poco's Windows backend converts UTF-8 paths to UTF-16 for file I/O.
+std::string PocoPath(const std::filesystem::path &path) {
+  const auto utf8 = path.u8string();
+  return {reinterpret_cast<const char *>(utf8.data()), utf8.size()};
+}
+
+std::filesystem::path EntryPath(std::string_view utf8) {
+  return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
 
 std::string ComputeFileSha256Hex(const std::filesystem::path &file_path) {
 #ifdef _WIN32
@@ -66,7 +75,7 @@ ArchiveExtractor::InspectArchive(const std::filesystem::path &archive_path) {
   }
 
   try {
-    Poco::SevenZip::Archive archive(archive_path.string());
+    Poco::SevenZip::Archive archive(PocoPath(archive_path));
     std::vector<ArchiveEntryInfo> entries;
     entries.reserve(archive.size());
 
@@ -94,7 +103,7 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
   }
 
   try {
-    Poco::SevenZip::Archive archive(archive_path.string());
+    Poco::SevenZip::Archive archive(PocoPath(archive_path));
 
     // Security step 1: Validate against Zip-Slip path traversal for every entry
     for (const auto &entry : archive) {
@@ -139,6 +148,7 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
     }
 
     std::filesystem::create_directories(target_dir);
+    const auto destination = PocoPath(target_dir);
 
     // Multi-threaded parallel extraction of entries across thread pool
     if (thread_pool_ && thread_pool_->ThreadCount() > 1) {
@@ -150,7 +160,8 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
 
       for (const auto &entry : archive) {
         if (entry.isDirectory()) {
-          std::filesystem::create_directories(target_dir / entry.path());
+          std::filesystem::create_directories(target_dir /
+                                              EntryPath(entry.path()));
           continue;
         }
 
@@ -158,12 +169,12 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
           if (failed.load())
             return;
           try {
-            auto out_path = target_dir / entry.path();
+            auto out_path = target_dir / EntryPath(entry.path());
             std::filesystem::create_directories(out_path.parent_path());
 
             // Each decoder owns its stream; sharing an archive races seek
             // state.
-            Poco::SevenZip::Archive reader(archive_path.string());
+            Poco::SevenZip::Archive reader(PocoPath(archive_path));
             const auto item = std::find_if(
                 reader.begin(), reader.end(), [&](const auto &candidate) {
                   return candidate.path() == entry.path();
@@ -174,7 +185,7 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
               error_code = ExtractionError::kDecompressionFailed;
               return;
             }
-            reader.extract(*item, target_dir.string());
+            reader.extract(*item, destination);
 
             // Security step 3: Verify SHA-256 against manifest
             if (manifest_verifier) {
@@ -212,10 +223,11 @@ ArchiveExtractor::ExtractArchive(const std::filesystem::path &archive_path,
       for (const auto &entry : archive) {
         if (entry.isDirectory())
           continue;
-        archive.extract(entry, target_dir.string());
+        archive.extract(entry, destination);
         if (manifest_verifier &&
             !manifest_verifier->VerifyHash(
-                entry.path(), ComputeFileSha256Hex(target_dir / entry.path())))
+                entry.path(),
+                ComputeFileSha256Hex(target_dir / EntryPath(entry.path()))))
           return ExtractionError::kHashMismatch;
         extracted_bytes += entry.size();
         if (progress_cb)

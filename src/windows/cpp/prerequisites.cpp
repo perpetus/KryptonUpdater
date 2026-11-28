@@ -169,7 +169,8 @@ std::string_view Name(PrerequisiteKind kind) {
 }
 
 std::expected<std::uint32_t, std::string>
-NativeInstall(void *, const PrerequisiteRequirement &requirement, bool silent) {
+InstallPrerequisite(const PrerequisiteRequirement &requirement, bool silent,
+                    const PrerequisiteProgress &progress) {
   // Deny writes and replacement between signature verification and execution,
   // including while an elevated Microsoft installer is running.
   Handle source(CreateFileW(requirement.installer.c_str(), GENERIC_READ,
@@ -233,9 +234,20 @@ NativeInstall(void *, const PrerequisiteRequirement &requirement, bool silent) {
   }
 
   Handle child(process_handle);
+  constexpr DWORD kProgressIntervalMs = 15'000;
+  DWORD wait = WAIT_FAILED;
+  if (child) {
+    unsigned elapsed_seconds = 0;
+    while ((wait = WaitForSingleObject(child.get(), kProgressIntervalMs)) ==
+           WAIT_TIMEOUT) {
+      elapsed_seconds += kProgressIntervalMs / 1000;
+      if (progress)
+        progress(std::format("Waiting for {} setup ({} seconds).",
+                             Name(requirement.kind), elapsed_seconds));
+    }
+  }
   DWORD exit_code = 0;
-  if (!child || WaitForSingleObject(child.get(), INFINITE) != WAIT_OBJECT_0 ||
-      !GetExitCodeProcess(child.get(), &exit_code))
+  if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(child.get(), &exit_code))
     return std::unexpected(std::format("Could not wait for {} ({}).",
                                        Name(requirement.kind), GetLastError()));
   return exit_code;
@@ -246,7 +258,8 @@ NativeInstall(void *, const PrerequisiteRequirement &requirement, bool silent) {
 std::expected<void, std::string>
 EnsureBrowserPrerequisites(const std::filesystem::path &payload_directory,
                            bool silent,
-                           const PrerequisiteOperations *operations) {
+                           const PrerequisiteOperations *operations,
+                           const PrerequisiteProgress &progress) {
   std::error_code error;
   const auto payload =
       std::filesystem::absolute(payload_directory, error).lexically_normal();
@@ -277,33 +290,46 @@ EnsureBrowserPrerequisites(const std::filesystem::path &payload_directory,
           PrerequisiteKind::kWindowsAppRuntime,
           payload / "prerequisites/WindowsAppRuntimeInstall-x64.exe",
           *runtime_minimum, *release}};
-  const PrerequisiteOperations native{nullptr, &NativeAvailable,
-                                      &NativeInstall};
-  const auto &platform = operations ? *operations : native;
-  if (!platform.is_available || !platform.install)
+  if (operations && (!operations->is_available || !operations->install))
     return std::unexpected("The prerequisite installer is unavailable.");
+  const auto available = [&](const PrerequisiteRequirement &requirement) {
+    return operations ? operations->is_available(operations->context,
+                                                 requirement, payload)
+                      : NativeAvailable(nullptr, requirement, payload);
+  };
   for (const auto &requirement : requirements) {
     if (!std::filesystem::is_regular_file(requirement.installer, error))
       return std::unexpected(
           std::format("The package is missing {}.", Name(requirement.kind)));
-    if (platform.is_available(platform.context, requirement, payload))
+    if (available(requirement))
       continue;
-    const auto result = platform.install(platform.context, requirement, silent);
+    if (progress)
+      progress(std::format("Installing {}. Approve Windows setup if prompted.",
+                           Name(requirement.kind)));
+    const auto result =
+        operations
+            ? operations->install(operations->context, requirement, silent)
+            : InstallPrerequisite(requirement, silent, progress);
     if (!result)
       return std::unexpected(result.error());
-    if (*result == ERROR_SUCCESS_REBOOT_REQUIRED ||
-        *result == ERROR_SUCCESS_REBOOT_INITIATED)
+
+    const auto is_code = [&](std::uint32_t code) {
+      return *result == code ||
+             *result == static_cast<std::uint32_t>(HRESULT_FROM_WIN32(code));
+    };
+    // The installer may request a restart for other programs even though
+    // the browser's required runtime is already usable.
+    const bool restart_initiated = is_code(ERROR_SUCCESS_REBOOT_INITIATED);
+    if (!restart_initiated && available(requirement))
+      continue;
+    if (restart_initiated || is_code(ERROR_SUCCESS_REBOOT_REQUIRED))
       return std::unexpected(std::format(
-          "Windows must restart to finish installing {}. Restart Windows, "
-          "then run this installer again.",
+          "Restart Windows to finish installing {}, then reopen Krypton Setup.",
           Name(requirement.kind)));
-    // Some runtime installers report an existing newer package as an error.
-    // Recheck actual availability instead of assuming an exit code proves it.
-    if (!platform.is_available(platform.context, requirement, payload))
-      return std::unexpected(std::format(
-          "{} is still unavailable after setup (code 0x{:08X}). The browser "
-          "has not been activated.",
-          Name(requirement.kind), *result));
+    return std::unexpected(std::format(
+        "{} is still unavailable after setup (code 0x{:08X}). The browser "
+        "has not been activated.",
+        Name(requirement.kind), *result));
   }
   return {};
 }

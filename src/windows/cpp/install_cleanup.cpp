@@ -175,9 +175,11 @@ void CleanupWorkers(const fs::path &cache,
 }
 void CleanupStaging(const fs::path &application) {
   Children(application, [&](const fs::directory_entry &entry) {
-    const auto name = entry.path().filename().string();
-    if (name.starts_with("app-") && name.ends_with(".staging") &&
-        SemVer::Parse(std::string_view(name).substr(4, name.size() - 12)) &&
+    const auto name = entry.path().filename().u8string();
+    if (name.size() >= 12 && name.starts_with(u8"app-") &&
+        name.ends_with(u8".staging") &&
+        SemVer::Parse({reinterpret_cast<const char *>(name.data() + 4),
+                       name.size() - 12}) &&
         Stale(entry))
       (void)VersionManager::RemoveOwnedDirectory(application, entry.path());
   });

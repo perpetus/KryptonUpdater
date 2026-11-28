@@ -6,6 +6,7 @@
 #include "krypton/updater/windows/install_cleanup.hpp"
 #include "krypton/updater/windows/release_security.hpp"
 #include "krypton/updater/windows/release_trust.hpp"
+#include "krypton/updater/windows/version_manager.hpp"
 // clang-format off
 #include <windows.h>
 #include <tlhelp32.h>
@@ -617,6 +618,23 @@ RunWorker(const BackgroundUpdateOptions &options,
   auto release = LoadRelease(pending);
   if (!release)
     return std::unexpected(release.error());
+  if (options.download_only) {
+    // Standalone setup can finish while the worker is downloading a release.
+    const auto latest_install = FindChromiumInstallation();
+    if (!latest_install || latest_install->application != installed.application)
+      return std::unexpected(
+          "The installation changed; the update remains staged.");
+    const auto latest_version = ParseBrowserVersion(latest_install->version);
+    const auto staged_version = ParseBrowserVersion(release->version);
+    if (latest_version && staged_version &&
+        *staged_version <= *latest_version &&
+        !fs::exists(latest_install->application / "new_chrome.exe", error) &&
+        !error) {
+      fs::remove(pending, error);
+      Status(cache, "up_to_date", 100, latest_install->version);
+      return "The staged update is already installed.";
+    }
+  }
   Status(cache, "ready", 100, release->version,
          "The verified update will install when Krypton closes.");
   if (options.download_only)
@@ -767,5 +785,39 @@ RunSignedUpdate(const BackgroundUpdateOptions &options) {
     Status(cache, "error", 0, {}, result.error());
   Log(cache, result ? *result : result.error());
   return result;
+}
+void ReconcileInstalledUpdateStatus(const fs::path &application) noexcept {
+  try {
+    const auto cache = application.parent_path() / "Update";
+    if (!VersionManager::IsPlainDirectory(cache))
+      return;
+    Handle lock(CreateFileW((cache / "worker.lock").c_str(),
+                            GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (lock.get() == INVALID_HANDLE_VALUE)
+      return;
+    const auto installed = FindChromiumInstallation();
+    if (!installed || installed->application != application)
+      return;
+    std::error_code error;
+    if (fs::exists(application / "new_chrome.exe", error) || error)
+      return;
+    const auto pending = cache / "pending.signed";
+    const bool has_pending = fs::exists(pending, error);
+    if (error)
+      return;
+    if (has_pending) {
+      const auto release = LoadRelease(pending, true);
+      if (!release)
+        return;
+      const auto next = ParseBrowserVersion(release->version);
+      const auto current = ParseBrowserVersion(installed->version);
+      if (!next || !current || *next > *current || !fs::remove(pending, error))
+        return;
+    }
+    Status(cache, "updated", 100, installed->version);
+  } catch (...) {
+    // Update status is advisory after setup has verified the installation.
+  }
 }
 } // namespace kr::updater::windows

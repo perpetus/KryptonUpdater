@@ -106,18 +106,22 @@ def stage(args):
     hosted_key = read_signing_key(args.signing_key_stdin)
     browser = args.browser_dir.resolve(strict=True)
     work = args.work_dir.resolve(strict=True)
+    browser_version = file_version(browser / "chrome.exe")
+    engine_version = file_version(browser / "chrome.exe", product=True)
+    for name in ("chrome.dll", "setup.exe"):
+        path = browser / name
+        if file_version(path) != browser_version:
+            raise ValueError(f"{name} must carry browser file version {browser_version}")
+        if file_version(path, product=True) != engine_version:
+            raise ValueError(f"{name} must carry browser engine version {engine_version}")
     payload = work / "payload"
     payload.mkdir()
     source = work / "chromium-payload"
     chrome = source / "Helium-bin"
     chrome.mkdir(parents=True)
-    browser_version = file_version(browser / "chrome.exe")
     for helper in (args.updater, args.uninstaller):
         if file_version(helper.resolve(strict=True)) != browser_version:
             raise ValueError(f"{helper.name} must carry browser file version {browser_version}")
-    engine_version = file_version(browser / "chrome.exe", product=True)
-    if file_version(browser / "setup.exe", product=True) != engine_version:
-        raise ValueError(f"Native setup must match the browser engine version {engine_version}")
     version = chrome / browser_version
     distribution = browser.parents[1] / "chrome/installer/mini_installer/chrome.release"
     rules = configparser.ConfigParser(interpolation=None, strict=False)

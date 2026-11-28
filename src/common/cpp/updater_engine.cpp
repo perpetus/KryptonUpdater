@@ -19,6 +19,7 @@
 #include "krypton/updater/windows/shell_registrar.hpp"
 #include "krypton/updater/windows/signed_update_service.hpp"
 #include "krypton/updater/windows/version_manager.hpp"
+#include <utility>
 #include <windows.h>
 #endif
 
@@ -147,10 +148,12 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
                                ? windows::AuthenticodeVerifier::Verify(absolute)
                                : windows::SignatureStatus::kVerificationFailed;
     if (signature != windows::SignatureStatus::kValidAndTrusted) {
+      const auto path = payload_path.u8string();
       state_machine_.ReportSecurityAlert(SecurityAlert{
           std::format("Payload signature verification: {}",
                       windows::SignatureStatusToString(signature)),
-          payload_path.string(), true});
+          std::string(reinterpret_cast<const char *>(path.data()), path.size()),
+          true});
       state_machine_.ReportError(
           "The installer payload has an untrusted signature.");
       return 1;
@@ -291,8 +294,10 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
   if (!options_.skip_prerequisites_for_testing) {
     state_machine_.ReportProgress(
         {0, 0, 0.0, 0.0f, "Checking Windows runtime prerequisites..."});
-    const auto prerequisites =
-        windows::EnsureBrowserPrerequisites(staging, options_.silent);
+    const auto prerequisites = windows::EnsureBrowserPrerequisites(
+        staging, options_.silent, nullptr, [this](std::string_view detail) {
+          state_machine_.ReportProgress({0, 0, 0.0, 0.0f, std::string(detail)});
+        });
     if (!prerequisites) {
       (void)windows::VersionManager::RemoveOwnedDirectory(root, staging);
       state_machine_.ReportError(prerequisites.error());
@@ -305,6 +310,7 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
     }
   }
   if (chromium) {
+    state_machine_.ReportProgress({0, 0, 0.0, 0.0f, "Installing Krypton..."});
     if (options_.verify_only_for_testing) {
       state_machine_.TransitionTo(UpdateState::kCompleted);
       return 0;
@@ -331,6 +337,7 @@ int UpdaterEngine::ExecuteOffline(const std::filesystem::path &payload_path,
             std::filesystem::copy_options::skip_existing, ec);
     }
     (void)windows::VersionManager::RemoveOwnedDirectory(root, staging);
+    windows::ReconcileInstalledUpdateStatus(options_.install_root);
     windows::CleanupInstallArtifacts(
         options_.install_root,
         package_hash ? std::string_view(*package_hash) : std::string_view{});
@@ -418,32 +425,75 @@ int UpdaterEngine::ExecuteOnline() {
   state_machine_.TransitionTo(UpdateState::kUpdateAvailable);
   state_machine_.TransitionTo(UpdateState::kDownloading);
   const auto archive = workspace->path() / "browser.7z";
-  const auto url = std::format("https://github.com/{}/releases/download/{}/{}",
-                               windows::kReleaseRepository, release->tag,
-                               release->full.name);
-  windows::HttpDownloader http;
-  const auto download = http.DownloadToFile(
-      url, archive,
-      [this](const windows::DownloadProgress &progress) {
-        const auto fraction =
-            progress.total_bytes
-                ? static_cast<float>(
-                      static_cast<double>(progress.bytes_received) /
-                      static_cast<double>(progress.total_bytes))
-                : 0.0f;
-        state_machine_.ReportProgress(
-            {progress.bytes_received, progress.total_bytes,
-             progress.bytes_per_second, fraction, "Downloading Krypton..."});
-      },
-      stop_source_.get_token(), release->full.size);
-  if (cancelled_ || !download ||
-      download->bytes_downloaded != release->full.size ||
-      download->sha256_hex != release->full.sha256) {
-    state_machine_.ReportError(
-        cancelled_
-            ? "Installation canceled."
-            : "The browser download failed its signed size or SHA-256 check.");
+  // Keep the verified download across a prerequisite restart. The workspace
+  // receives its own copy so extraction and sidecar writes remain isolated.
+  const auto application = windows::DefaultChromiumApplicationDirectory();
+  if (application.empty()) {
+    state_machine_.ReportError("Could not locate Krypton's package cache.");
     return 1;
+  }
+  const auto packages = application.parent_path() / "Update/packages";
+  std::error_code cache_error;
+  std::filesystem::create_directories(packages, cache_error);
+  if (cache_error || !windows::VersionManager::IsPlainDirectory(packages)) {
+    state_machine_.ReportError("Could not open Krypton's package cache.");
+    return 1;
+  }
+  const auto cached = packages / (release->full.sha256 + ".7z");
+  bool reused = false;
+  if (const auto cache_lock = windows::LockFileForVerification(cached)) {
+    const auto size = std::filesystem::file_size(cached, cache_error);
+    reused =
+        !cache_error && size == release->full.size &&
+        std::filesystem::copy_file(cached, archive, cache_error) &&
+        windows::FileMatches(archive, release->full.size, release->full.sha256);
+  }
+  if (reused) {
+    state_machine_.ReportProgress(
+        {release->full.size, release->full.size, 0.0, 1.0f,
+         "Resumed from the verified Krypton download."});
+  } else {
+    const auto url = std::format(
+        "https://github.com/{}/releases/download/{}/{}",
+        windows::kReleaseRepository, release->tag, release->full.name);
+    windows::HttpDownloader http;
+    const auto download = http.DownloadToFile(
+        url, archive,
+        [this](const windows::DownloadProgress &progress) {
+          const auto fraction =
+              progress.total_bytes
+                  ? static_cast<float>(
+                        static_cast<double>(progress.bytes_received) /
+                        static_cast<double>(progress.total_bytes))
+                  : 0.0f;
+          state_machine_.ReportProgress(
+              {progress.bytes_received, progress.total_bytes,
+               progress.bytes_per_second, fraction, "Downloading Krypton..."});
+        },
+        stop_source_.get_token(), release->full.size);
+    if (cancelled_ || !download ||
+        download->bytes_downloaded != release->full.size ||
+        download->sha256_hex != release->full.sha256) {
+      state_machine_.ReportError(cancelled_ ? "Installation canceled."
+                                            : "The browser download failed its "
+                                              "signed size or SHA-256 check.");
+      return 1;
+    }
+    auto partial = packages / workspace->path().filename();
+    partial += L".part";
+    const OnExit clean_partial([&] {
+      (void)windows::VersionManager::RemoveOwnedFile(packages, partial);
+    });
+    if (!std::filesystem::copy_file(archive, partial, cache_error) ||
+        !MoveFileExW(partial.c_str(), cached.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      if (!windows::FileMatches(cached, release->full.size,
+                                release->full.sha256)) {
+        state_machine_.ReportError(
+            "Could not retain the verified Krypton download.");
+        return 1;
+      }
+    }
   }
   if (const auto saved = windows::WriteInstallManifest(archive, *release);
       !saved) {

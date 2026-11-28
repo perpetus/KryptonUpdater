@@ -138,9 +138,10 @@ VersionManager::GetInstalledVersions(const std::filesystem::path &root) {
   for (const auto &entry : std::filesystem::directory_iterator(root, ec)) {
     if (!entry.is_directory())
       continue;
-    std::string name = entry.path().filename().string();
-    if (name.starts_with("app-") && !name.ends_with(".staging")) {
-      std::string_view ver_part = std::string_view(name).substr(4);
+    const auto name = entry.path().filename().u8string();
+    if (name.starts_with(u8"app-") && !name.ends_with(u8".staging")) {
+      std::string_view ver_part(reinterpret_cast<const char *>(name.data() + 4),
+                                name.size() - 4);
       auto ver = SemVer::Parse(ver_part);
       if (ver) {
         result.emplace_back(*ver, entry.path());

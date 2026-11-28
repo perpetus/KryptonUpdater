@@ -22,4 +22,7 @@ FetchInstallRelease(std::stop_token stop = {});
 [[nodiscard]] std::expected<void, std::string>
 WriteInstallManifest(const std::filesystem::path &archive,
                      const SignedRelease &release);
+// Complete a pending update already applied by standalone setup.
+void ReconcileInstalledUpdateStatus(
+    const std::filesystem::path &application) noexcept;
 } // namespace kr::updater::windows

@@ -22,6 +22,8 @@
 namespace kr::updater::windows {
 namespace {
 
+// Native setup and the browser read the product registration in this view.
+constexpr wchar_t kClientsKey[] = L"Software\\Krypton";
 constexpr wchar_t kUninstallKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Krypton Krypton";
 
@@ -44,31 +46,55 @@ ScopedFileHandle VerifyNativeSetup(const std::filesystem::path &setup,
   return lock;
 }
 
-std::wstring ReadRegistration(const wchar_t *value) {
+std::wstring ReadRegistration(const wchar_t *key, const wchar_t *value) {
   DWORD bytes = 0;
-  if (RegGetValueW(HKEY_CURRENT_USER, kUninstallKey, value, RRF_RT_REG_SZ,
-                   nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+  if (RegGetValueW(HKEY_CURRENT_USER, key, value,
+                   RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY, nullptr, nullptr,
+                   &bytes) != ERROR_SUCCESS ||
       bytes < sizeof(wchar_t) || bytes > 65536)
     return {};
   std::wstring result(bytes / sizeof(wchar_t), L'\0');
-  if (RegGetValueW(HKEY_CURRENT_USER, kUninstallKey, value, RRF_RT_REG_SZ,
-                   nullptr, result.data(), &bytes) != ERROR_SUCCESS)
+  if (RegGetValueW(HKEY_CURRENT_USER, key, value,
+                   RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY, nullptr,
+                   result.data(), &bytes) != ERROR_SUCCESS)
     return {};
   while (!result.empty() && result.back() == L'\0')
     result.pop_back();
   return result;
 }
 
-bool WriteRegistration(const wchar_t *name, const std::wstring &value) {
-  HKEY key = nullptr;
-  if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, KEY_SET_VALUE, &key) !=
-      ERROR_SUCCESS)
+bool WriteUninstallRegistration(const std::filesystem::path &uninstaller,
+                                std::string_view version) {
+  const auto components = ParseBrowserVersion(version);
+  if (!components)
     return false;
-  const auto result = RegSetValueExW(
-      key, name, 0, REG_SZ, reinterpret_cast<const BYTE *>(value.c_str()),
-      static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
-  RegCloseKey(key);
-  return result == ERROR_SUCCESS;
+  HKEY opened = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0,
+                    KEY_SET_VALUE | KEY_WOW64_32KEY, &opened) != ERROR_SUCCESS)
+    return false;
+  const std::unique_ptr<std::remove_pointer_t<HKEY>, decltype(&RegCloseKey)>
+      key(opened, RegCloseKey);
+  const auto write_string = [&](const wchar_t *name,
+                                const std::wstring &value) {
+    return RegSetValueExW(key.get(), name, 0, REG_SZ,
+                          reinterpret_cast<const BYTE *>(value.c_str()),
+                          static_cast<DWORD>((value.size() + 1) *
+                                             sizeof(wchar_t))) == ERROR_SUCCESS;
+  };
+  const auto write_dword = [&](const wchar_t *name, DWORD value) {
+    return RegSetValueExW(key.get(), name, 0, REG_DWORD,
+                          reinterpret_cast<const BYTE *>(&value),
+                          sizeof(value)) == ERROR_SUCCESS;
+  };
+  const std::wstring display_version(version.begin(), version.end());
+  const auto command = std::format(L"\"{}\" --uninstall", uninstaller.native());
+  // Match the native setup's build and revision fields.
+  return write_string(L"UninstallString", command) &&
+         write_string(L"QuietUninstallString", command + L" --silent") &&
+         write_dword(L"VersionMajor", (*components)[2]) &&
+         write_dword(L"VersionMinor", (*components)[3]) &&
+         write_string(L"Version", display_version) &&
+         write_string(L"DisplayVersion", display_version);
 }
 void RetryOldVersionCleanup(const ChromiumInstallation &installed) {
   const auto setup =
@@ -183,8 +209,8 @@ bool IsChromiumVersion(std::string_view version) noexcept {
 }
 
 std::optional<ChromiumInstallation> FindChromiumInstallation() {
-  const auto location = ReadRegistration(L"InstallLocation");
-  const auto registered_version = ReadRegistration(L"DisplayVersion");
+  const auto location = ReadRegistration(kUninstallKey, L"InstallLocation");
+  const auto registered_version = ReadRegistration(kClientsKey, L"pv");
   std::string version;
   for (const auto ch : registered_version) {
     if (ch > 127)
@@ -291,13 +317,9 @@ InstallChromiumBrowser(const std::filesystem::path &package,
   if (!std::filesystem::is_regular_file(uninstaller))
     return std::unexpected(
         "The native installation is missing KryptonUninstaller.exe.");
-  if (!WriteRegistration(
-          L"UninstallString",
-          std::format(L"\"{}\" --uninstall", uninstaller.wstring())) ||
-      !WriteRegistration(
-          L"QuietUninstallString",
-          std::format(L"\"{}\" --uninstall --silent", uninstaller.wstring())))
-    return std::unexpected("Could not register Krypton's uninstaller.");
+  if (!WriteUninstallRegistration(uninstaller, version))
+    return std::unexpected(
+        "Could not update Krypton's Installed apps registration.");
   RetryOldVersionCleanup(*installed);
   return installed->application / "chrome.exe";
 }

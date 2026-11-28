@@ -195,10 +195,11 @@ RemoveLegacyProgramFiles(const std::filesystem::path &root) {
   std::error_code error;
   for (std::filesystem::directory_iterator entry(root, error), end;
        !error && entry != end; entry.increment(error)) {
-    const auto filename = entry->path().filename().string();
-    if (!filename.starts_with("app-"))
+    const auto filename = entry->path().filename().u8string();
+    if (!filename.starts_with(u8"app-"))
       continue;
-    std::string_view version(filename);
+    std::string_view version(reinterpret_cast<const char *>(filename.data()),
+                             filename.size());
     version.remove_prefix(4);
     if (version.ends_with(".staging"))
       version.remove_suffix(8);

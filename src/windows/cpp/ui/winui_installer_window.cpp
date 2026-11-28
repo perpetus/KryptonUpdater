@@ -22,6 +22,8 @@
 
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 // clang-format on
+// The Win32 alias conflicts with the XAML storyboard API.
+#undef GetCurrentTime
 #include <winrt/Windows.Devices.Input.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
@@ -1957,11 +1959,15 @@ void WinUIInstallerWindow::OnProgress(const ProgressReport &progress) {
     if (progress.status_detail.find("resumed") != std::string::npos ||
         progress.status_detail.find("Resumed") != std::string::npos)
       impl_->is_resumed = true;
-    impl_->stage_text =
-        impl_->is_uninstall
-            ? L"Your browsing data will be kept."
-            : GetDynamicStageText(impl_->current_state, progress.fraction,
-                                  impl_->is_resumed);
+    if (impl_->is_uninstall)
+      impl_->stage_text = L"Your browsing data will be kept.";
+    else if (impl_->current_state == UpdateState::kInstalling &&
+             !progress.status_detail.empty())
+      impl_->stage_text.assign(progress.status_detail.begin(),
+                               progress.status_detail.end());
+    else
+      impl_->stage_text = GetDynamicStageText(
+          impl_->current_state, progress.fraction, impl_->is_resumed);
   }
   impl_->NotifyStatus();
 }

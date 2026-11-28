@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <string_view>
 
 namespace kr::updater::windows {
 
@@ -28,9 +30,12 @@ struct PrerequisiteOperations {
 
 // Called on the installer worker after extraction and SHA-256 verification,
 // before committing a browser version or offering to launch it.
+using PrerequisiteProgress = std::function<void(std::string_view)>;
+
 [[nodiscard]] std::expected<void, std::string>
 EnsureBrowserPrerequisites(const std::filesystem::path &payload, bool silent,
-                           const PrerequisiteOperations *operations = nullptr);
+                           const PrerequisiteOperations *operations = nullptr,
+                           const PrerequisiteProgress &progress = {});
 
 // Read-only capability check used by packaging diagnostics.
 [[nodiscard]] std::expected<void, std::string>
